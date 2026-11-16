@@ -122,8 +122,6 @@ def classify_session_and_regime(
 
 
 def _session_context(observed_at: datetime) -> tuple[str, str]:
-    if observed_at.weekday() >= 5:
-        return "WEEKEND", "IANA_MARKET_SESSION_TIMEZONES"
     try:
         london = observed_at.astimezone(ZoneInfo("Europe/London"))
         new_york = observed_at.astimezone(ZoneInfo("America/New_York"))
@@ -133,17 +131,19 @@ def _session_context(observed_at: datetime) -> tuple[str, str]:
         # Windows Python can be installed without the tzdata package. Use a
         # clearly-labelled UTC schedule rather than failing the entire worker.
         london = observed_at
-        new_york = observed_at.replace(hour=(observed_at.hour - 5) % 24)
-        asia = observed_at.replace(hour=(observed_at.hour + 9) % 24)
+        new_york = observed_at - timedelta(hours=5)
+        asia = observed_at + timedelta(hours=9)
         timezone_basis = "UTC_APPROXIMATION_NO_TZDATA"
-    london_open = 8 <= london.hour < 17
-    new_york_open = 8 <= new_york.hour < 17
+    london_open = london.weekday() < 5 and 8 <= london.hour < 17
+    new_york_open = new_york.weekday() < 5 and 8 <= new_york.hour < 17
     if london_open and new_york_open:
         return "LONDON_NEW_YORK_OVERLAP", timezone_basis
     if london_open:
         return "LONDON", timezone_basis
     if new_york_open:
         return "NEW_YORK", timezone_basis
-    if 8 <= asia.hour < 17:
+    if asia.weekday() < 5 and 8 <= asia.hour < 17:
         return "ASIA", timezone_basis
+    if observed_at.weekday() >= 5:
+        return "WEEKEND", timezone_basis
     return "OFF_HOURS", timezone_basis

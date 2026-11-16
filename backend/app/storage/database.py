@@ -15,6 +15,9 @@ BROKER_SESSION_TRANSITIONS_MIGRATION = 5
 STRATEGY_JOURNAL_MIGRATION = 6
 SIGNAL_HISTORY_MIGRATION = 7
 STRATEGY_CONFIGURATION_MIGRATION = 8
+SIGNAL_FOLLOWUP_MIGRATION = 9
+SIGNAL_FOLLOWUP_VERSION = "m5-12-close-direction-v1"
+PAPER_OUTCOME_LABEL_VERSION = "paper-candidate-direction-v2"
 MAX_FUTURE_SOURCE_SECONDS = 60
 
 
@@ -115,6 +118,12 @@ def _apply_research_pipeline_migrations(connection: sqlite3.Connection) -> None:
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             (STRATEGY_CONFIGURATION_MIGRATION,),
+        )
+    if SIGNAL_FOLLOWUP_MIGRATION not in applied:
+        _create_signal_followup_table(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (SIGNAL_FOLLOWUP_MIGRATION,),
         )
 
 
@@ -383,6 +392,22 @@ def _create_signal_history_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_signal_followup_table(connection: sqlite3.Connection) -> None:
+    """Append-only completed-candle movement; never a fill or P&L record."""
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS signal_forward_outcomes ("
+        "signal_id TEXT NOT NULL REFERENCES signal_history(signal_id), "
+        "label_version TEXT NOT NULL, broker_server TEXT NOT NULL, "
+        "horizon_bars INTEGER NOT NULL CHECK(horizon_bars = 12), "
+        "anchor_close_utc TEXT NOT NULL, outcome_close_utc TEXT NOT NULL, "
+        "anchor_close REAL NOT NULL, outcome_close REAL NOT NULL, "
+        "directional_change REAL NOT NULL, "
+        "directional_state TEXT NOT NULL CHECK(directional_state IN ('FAVORABLE', 'ADVERSE', 'FLAT')), "
+        "source TEXT NOT NULL, labelled_at_utc TEXT NOT NULL, "
+        "PRIMARY KEY(signal_id, label_version))"
+    )
+
+
 def _create_strategy_configuration_table(connection: sqlite3.Connection) -> None:
     """Persist owner-controlled strategy enablement without rewriting evidence.
 
@@ -470,13 +495,66 @@ def record_signal_history(
             "signal_id, provided_at_utc, symbol, source, source_timestamp_utc, data_status, analysis_mode, "
             "decision, market_context, summary, event_risk_state, paper_status, input_fingerprint, "
             "reason_codes_json, payload_json"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(signal_id) DO NOTHING",
             (
                 signal_id, provided_at_utc.isoformat(), symbol, source,
                 source_timestamp_utc.isoformat() if source_timestamp_utc else None,
                 data_status, analysis_mode, decision, market_context, summary, event_risk_state, paper_status,
                 input_fingerprint, json.dumps(reason_codes, sort_keys=True), json.dumps(payload, sort_keys=True),
             ),
+        )
+        connection.commit()
+
+
+def read_pending_signal_followups(path: Path, *, symbol: str, limit: int = 1_000) -> list[dict[str, Any]]:
+    """Find automatic signals whose 12-bar directional movement is not yet observed."""
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        records = connection.execute(
+            "SELECT signal_id, decision, payload_json FROM signal_history AS signal "
+            "WHERE symbol = ? AND analysis_mode = 'AUTOMATIC_RESEARCH_WATCH_V1' "
+            "AND NOT EXISTS (SELECT 1 FROM signal_forward_outcomes AS outcome "
+            "WHERE outcome.signal_id = signal.signal_id AND outcome.label_version = ?) "
+            "ORDER BY provided_at_utc DESC LIMIT ?",
+            (symbol, SIGNAL_FOLLOWUP_VERSION, limit),
+        ).fetchall()
+    pending = []
+    for record in records:
+        payload = json.loads(record["payload_json"])
+        levels = payload.get("watch", {}).get("reference_levels") or {}
+        broker_server = payload.get("broker_server")
+        anchor_close_utc = levels.get("source_candle_close_utc")
+        if broker_server and anchor_close_utc and record["decision"] in {"WATCH_LONG", "WATCH_SHORT"}:
+            pending.append({
+                "signal_id": record["signal_id"],
+                "decision": record["decision"],
+                "broker_server": broker_server,
+                "anchor_close_utc": datetime.fromisoformat(anchor_close_utc),
+            })
+    return pending
+
+
+def record_signal_followup(
+    path: Path, *, signal_id: str, broker_server: str,
+    anchor_close_utc: datetime, outcome_close_utc: datetime,
+    anchor_close: float, outcome_close: float, directional_change: float,
+    directional_state: str, labelled_at_utc: datetime,
+) -> None:
+    """Freeze a broker-matched, completed-M5 close comparison once per signal."""
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO signal_forward_outcomes("
+            "signal_id, label_version, broker_server, horizon_bars, anchor_close_utc, outcome_close_utc, "
+            "anchor_close, outcome_close, directional_change, directional_state, source, labelled_at_utc"
+            ") VALUES (?, ?, ?, 12, ?, ?, ?, ?, ?, ?, 'MT5_COMPLETED_M5_CANDLES', ?) "
+            "ON CONFLICT(signal_id, label_version) DO NOTHING",
+            (signal_id, SIGNAL_FOLLOWUP_VERSION, broker_server, anchor_close_utc.isoformat(),
+             outcome_close_utc.isoformat(), anchor_close, outcome_close, directional_change,
+             directional_state, labelled_at_utc.isoformat()),
         )
         connection.commit()
 
@@ -490,17 +568,37 @@ def read_recent_signal_history(path: Path, *, symbol: str | None, limit: int) ->
         connection.row_factory = sqlite3.Row
         records = connection.execute(
             "SELECT signal_id, provided_at_utc, symbol, source, source_timestamp_utc, data_status, analysis_mode, "
-            "decision, market_context, summary, event_risk_state, paper_status, input_fingerprint, reason_codes_json "
-            "FROM signal_history" + clause + " ORDER BY provided_at_utc DESC LIMIT ?",
+            "decision, market_context, summary, event_risk_state, paper_status, input_fingerprint, reason_codes_json, payload_json "
+            "FROM signal_history" + clause + " ORDER BY provided_at_utc DESC, signal_id DESC LIMIT ?",
             parameters,
         ).fetchall()
-    return [
-        {
-            **{key: value for key, value in dict(record).items() if key != "reason_codes_json"},
+        signal_ids = [record["signal_id"] for record in records]
+        outcomes = {}
+        if signal_ids:
+            placeholders = ", ".join("?" for _ in signal_ids)
+            outcome_rows = connection.execute(
+                "SELECT * FROM signal_forward_outcomes WHERE label_version = ? "
+                f"AND signal_id IN ({placeholders})",
+                (SIGNAL_FOLLOWUP_VERSION, *signal_ids),
+            ).fetchall()
+            outcomes = {row["signal_id"]: dict(row) for row in outcome_rows}
+    entries: list[dict[str, Any]] = []
+    for record in records:
+        automatic = record["analysis_mode"] == "AUTOMATIC_RESEARCH_WATCH_V1"
+        payload = json.loads(record["payload_json"]) if automatic else {}
+        watch = payload.get("watch", {}) if isinstance(payload, dict) else {}
+        entries.append({
+            **{key: value for key, value in dict(record).items() if key not in {"reason_codes_json", "payload_json"}},
             "reason_codes": json.loads(record["reason_codes_json"]),
-        }
-        for record in records
-    ]
+            "signal_kind": "AUTOMATIC" if automatic else "ON_DEMAND",
+            "broker_server": payload.get("broker_server") if automatic else None,
+            "feature_set_version": payload.get("feature_set_version") if automatic else None,
+            "reference_levels": watch.get("reference_levels") if isinstance(watch, dict) else None,
+            "signal_proof": watch.get("signal_proof") if isinstance(watch, dict) else None,
+            "expires_at_utc": watch.get("expires_at_utc") if isinstance(watch, dict) else None,
+            "forward_outcome": outcomes.get(record["signal_id"]),
+        })
+    return entries
 
 
 def write_settings(path: Path, values: dict[str, str]) -> None:
@@ -894,6 +992,18 @@ def fail_research_job(path: Path, *, job_id: str, reason_codes: list[str]) -> No
         connection.commit()
 
 
+def invalidate_research_job(path: Path, *, job_id: str, reason_codes: list[str]) -> None:
+    """Retain a claimed job as evidence when its original as-of inputs cannot be recovered."""
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE research_jobs SET state = 'INVALIDATED', completed_at_utc = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "reason_codes_json = ? WHERE job_id = ? AND state = 'RUNNING'",
+            (json.dumps(reason_codes), job_id),
+        )
+        connection.commit()
+
+
 def recover_interrupted_research_jobs(path: Path) -> int:
     initialize_database(path)
     with sqlite3.connect(path) as connection:
@@ -1075,6 +1185,7 @@ def read_operations_status(path: Path) -> dict[str, Any]:
         alerts.append("RESEARCH_JOB_FAILURES_TODAY")
     return {
         "kill_switch_enabled": kill_switch,
+        "research_pipeline_enabled": controls.get("research_pipeline_enabled", "true").lower() == "true",
         "model_promotion_state": controls.get("model_promotion_state", "REVIEW_REQUIRED"),
         "daily_research_failure_count": failures,
         "alerts": alerts,
@@ -1298,6 +1409,11 @@ def label_mature_frozen_decisions(
             index, anchor = entry
             if index + horizon_bars >= len(candles):
                 continue
+            if any(
+                candle.open_time_utc != anchor.open_time_utc + timedelta(minutes=5 * offset)
+                for offset, candle in enumerate(candles[index:index + horizon_bars + 1])
+            ):
+                continue
             outcome = candles[index + horizon_bars]
             delta = outcome.close - anchor.close
             decision = row["decision"]
@@ -1334,8 +1450,9 @@ def read_validation_summary(path: Path, *, symbol: str | None) -> dict[str, Any]
         labelled = connection.execute(
             "SELECT decision.decision, decision.session_regime, label.directional_match, label.outcome_price_delta "
             "FROM frozen_research_decisions AS decision JOIN paper_decision_labels AS label "
-            "ON label.decision_id = decision.decision_id" + where + " ORDER BY decision.anchor_time_utc ASC",
-            params,
+            "ON label.decision_id = decision.decision_id AND label.label_version = ?"
+            + where + " ORDER BY decision.anchor_time_utc ASC",
+            (PAPER_OUTCOME_LABEL_VERSION, *params),
         ).fetchall()
     matches = sum(int(row["directional_match"] or 0) for row in labelled)
     count = len(labelled)
@@ -1363,10 +1480,120 @@ def read_validation_summary(path: Path, *, symbol: str | None) -> dict[str, Any]
         "regime_counts": regimes,
         "maximum_drawdown_points": None,
         "cost_status": "COSTS_INCOMPLETE",
+        "proof_audit": read_signal_proof_audit(path, symbol=symbol),
         "reason_codes": [
             "CHRONOLOGICAL_LABELS_ONLY", "HELD_OUT_NOT_USED_FOR_PROMOTION",
             "COMMISSION_AND_SLIPPAGE_UNAVAILABLE", "MANUAL_PROMOTION_REQUIRED", "NO_ORDER_EXECUTION",
         ],
+    }
+
+
+def read_signal_proof_audit(path: Path, *, symbol: str | None, limit: int = 500) -> dict[str, Any]:
+    """Summarize stored decision-time proof, not a historical profit replay."""
+    base_reasons = ["SYMBOL_ONLY_LEGACY_RUNS", "NOT_PERFORMANCE_VALIDATION", "NO_ORDER_EXECUTION"]
+    if not symbol:
+        return {
+            "source": "LOCAL_FROZEN_RESEARCH_RUNS", "sample_limit": limit, "sampled_runs": 0,
+            "proof_evaluated_runs": 0, "eligible_runs": 0, "published_signals": 0,
+            "latest_proof_anchor_utc": None, "failed_checks": [],
+            "reason_codes": [*base_reasons, "SYMBOL_NOT_CONFIGURED"],
+        }
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT anchor_time_utc, response_json FROM research_runs WHERE symbol = ? "
+            "ORDER BY anchor_time_utc DESC, run_id DESC LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+        published = connection.execute(
+            "SELECT COUNT(*) FROM signal_history WHERE symbol = ? "
+            "AND analysis_mode = 'AUTOMATIC_RESEARCH_WATCH_V1'",
+            (symbol,),
+        ).fetchone()[0]
+    failed: dict[str, int] = {}
+    evaluated = eligible = 0
+    latest_anchor: str | None = None
+    for anchor, raw_response in rows:
+        watch = json.loads(raw_response).get("live_research_watch") or {}
+        proof = watch.get("signal_proof") or {}
+        checks = proof.get("checks")
+        if not isinstance(checks, list) or not checks:
+            continue
+        evaluated += 1
+        if latest_anchor is None:
+            latest_anchor = anchor
+        if proof.get("publication_state") == "ELIGIBLE":
+            eligible += 1
+        for check in checks:
+            if isinstance(check, dict) and check.get("passed") is False and isinstance(check.get("code"), str):
+                code = check["code"]
+                failed[code] = failed.get(code, 0) + 1
+    return {
+        "source": "LOCAL_FROZEN_RESEARCH_RUNS", "sample_limit": limit,
+        "sampled_runs": len(rows), "proof_evaluated_runs": evaluated,
+        "eligible_runs": eligible, "published_signals": int(published),
+        "latest_proof_anchor_utc": latest_anchor,
+        "failed_checks": [
+            {"code": code, "runs": count}
+            for code, count in sorted(failed.items(), key=lambda item: (-item[1], item[0]))
+        ],
+        "reason_codes": [
+            *base_reasons,
+            *(["NO_PROOF_EVIDENCE_IN_SAMPLE"] if not evaluated else []),
+            *(["NO_ELIGIBLE_PROOFS_IN_SAMPLE"] if evaluated and not eligible else []),
+        ],
+    }
+
+
+def read_research_coverage(path: Path, *, symbol: str | None, broker_server: str | None) -> dict[str, Any]:
+    """Compare archived broker bars with persisted decisions, without inventing closed-market bars.
+
+    Legacy research runs have no broker-server column, so their identity is
+    symbol-scoped and the result must not be represented as broker-verified.
+    """
+    empty = {
+        "state": "SOURCE_IDENTITY_UNAVAILABLE" if not broker_server else "NO_ARCHIVE",
+        "broker_server": broker_server,
+        "identity_scope": "SYMBOL_ONLY_LEGACY_RUNS",
+        "latest_completed_m5_open_utc": None,
+        "latest_decision_m5_open_utc": None,
+        "unprocessed_archived_bars": 0,
+        "first_unprocessed_m5_open_utc": None,
+    }
+    if not symbol or not broker_server:
+        return empty
+    initialize_database(path)
+    with sqlite3.connect(path) as connection:
+        latest_archive = connection.execute(
+            "SELECT MAX(open_time_utc) FROM market_candles "
+            "WHERE source = 'MT5' AND broker_server = ? AND symbol = ? AND timeframe = 'M5'",
+            (broker_server, symbol),
+        ).fetchone()[0]
+        first_run, latest_run = connection.execute(
+            "SELECT MIN(anchor_time_utc), MAX(anchor_time_utc) FROM research_runs "
+            "WHERE symbol = ? AND invalidated_at_utc IS NULL",
+            (symbol,),
+        ).fetchone()
+        if not latest_archive:
+            return empty
+        if not first_run:
+            return {**empty, "state": "NO_RESEARCH_HISTORY", "latest_completed_m5_open_utc": latest_archive}
+        missing_count, first_missing = connection.execute(
+            "SELECT COUNT(*), MIN(c.open_time_utc) FROM market_candles c "
+            "WHERE c.source = 'MT5' AND c.broker_server = ? AND c.symbol = ? "
+            "AND c.timeframe = 'M5' AND c.open_time_utc >= ? "
+            "AND NOT EXISTS (SELECT 1 FROM research_runs r WHERE r.symbol = c.symbol "
+            "AND r.anchor_time_utc = c.open_time_utc AND r.invalidated_at_utc IS NULL)",
+            (broker_server, symbol, first_run),
+        ).fetchone()
+    state = "BEHIND_ARCHIVE" if latest_run < latest_archive else "CURRENT_WITH_GAPS" if missing_count else "CURRENT"
+    return {
+        **empty,
+        "state": state,
+        "latest_completed_m5_open_utc": latest_archive,
+        "latest_decision_m5_open_utc": latest_run,
+        "unprocessed_archived_bars": int(missing_count),
+        "first_unprocessed_m5_open_utc": first_missing,
     }
 
 

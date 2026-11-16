@@ -9,7 +9,7 @@ function timeOf(candle: Candle): UTCTimestamp {
 }
 
 export function completedCandles(candles: Candle[]): Candle[] {
-  return candles.filter((candle) => candle.completed);
+  return candles.filter((candle) => candle.completed).sort((left, right) => left.open_time_utc.localeCompare(right.open_time_utc));
 }
 
 function emaValues(values: number[], period: number): Array<number | null> {
@@ -45,23 +45,26 @@ export function bollingerSeries(candles: Candle[], period = 20, deviations = 2):
   return { upper, lower };
 }
 
-export function tickActivityVwap(candles: Candle[]): IndicatorPoint[] {
+export function tickActivityVwapSessions(candles: Candle[]): IndicatorPoint[][] {
   let session = "";
   let weightedPrice = 0;
   let activity = 0;
-  return completedCandles(candles).flatMap((candle) => {
+  const sessions: IndicatorPoint[][] = [];
+  for (const candle of completedCandles(candles)) {
     const nextSession = candle.open_time_utc.slice(0, 10);
     if (nextSession !== session) {
       session = nextSession;
       weightedPrice = 0;
       activity = 0;
+      sessions.push([]);
     }
     const weight = Math.max(candle.tick_volume, 0);
-    if (!weight) return [];
+    if (!weight) continue;
     weightedPrice += ((candle.high + candle.low + candle.close) / 3) * weight;
     activity += weight;
-    return [{ time: timeOf(candle), value: weightedPrice / activity }];
-  });
+    sessions[sessions.length - 1].push({ time: timeOf(candle), value: weightedPrice / activity });
+  }
+  return sessions.filter((points) => points.length > 0);
 }
 
 export function tickActivitySeries(candles: Candle[]): ActivityPoint[] {
@@ -87,11 +90,14 @@ function latest(values: IndicatorPoint[]): number | null {
 function rsi(values: number[], period = 14): number | null {
   if (values.length <= period) return null;
   const changes = values.slice(1).map((value, index) => value - values[index]);
-  const window = changes.slice(-period);
-  const gain = window.filter((value) => value > 0).reduce((sum, value) => sum + value, 0) / period;
-  const loss = Math.abs(window.filter((value) => value < 0).reduce((sum, value) => sum + value, 0)) / period;
-  if (!loss) return gain ? 100 : 50;
-  return 100 - 100 / (1 + gain / loss);
+  let averageGain = changes.slice(0, period).reduce((sum, value) => sum + Math.max(value, 0), 0) / period;
+  let averageLoss = changes.slice(0, period).reduce((sum, value) => sum + Math.max(-value, 0), 0) / period;
+  for (const change of changes.slice(period)) {
+    averageGain = ((averageGain * (period - 1)) + Math.max(change, 0)) / period;
+    averageLoss = ((averageLoss * (period - 1)) + Math.max(-change, 0)) / period;
+  }
+  if (!averageLoss) return averageGain ? 100 : 50;
+  return 100 - 100 / (1 + averageGain / averageLoss);
 }
 
 function atr(candles: Candle[], period = 14): number | null {
@@ -101,7 +107,9 @@ function atr(candles: Candle[], period = 14): number | null {
     Math.abs(candle.high - candles[index].close),
     Math.abs(candle.low - candles[index].close),
   ));
-  return ranges.slice(-period).reduce((sum, value) => sum + value, 0) / period;
+  let result = ranges.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  for (const value of ranges.slice(period)) result = ((result * (period - 1)) + value) / period;
+  return result;
 }
 
 export function indicatorReadings(candles: Candle[]): IndicatorReadings {

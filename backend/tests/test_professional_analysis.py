@@ -4,6 +4,19 @@ from datetime import UTC, datetime, timedelta
 
 from app.analysis.professional import estimated_order_flow, opening_range, professional_research, volume_profile
 from app.schemas.market import Candle, DataQualityReport, DataStatus, QuoteResponse
+from app.analysis.professional import risk_engine
+import pytest
+
+
+@pytest.mark.parametrize("update", [{"tick_age_seconds": 30}, {"tick_age_seconds": -1}, {"tick_value": float("inf")}, {"ask": 4000}])
+def test_risk_gate_rejects_stale_crossed_or_nonfinite_contract_data(update):
+    now = datetime.now(UTC)
+    quote = QuoteResponse(observed_at_utc=now, source_timestamp_utc=now, data_status=DataStatus.LIVE,
+                         symbol="XAUUSD", bid=4100, ask=4100.3, point=0.01, tick_size=0.01, tick_value=1,
+                         volume_min=0.01, volume_max=100, volume_step=0.01, contract_size=100,
+                         tick_age_seconds=0.2, spread_points=30).model_copy(update=update)
+    result = risk_engine(quote, "NO_EVENT_IN_EXPORT", [])
+    assert result.state == "DATA_UNAVAILABLE"
 
 
 def bar(at: datetime, close: float, *, high: float | None = None, low: float | None = None, volume: int = 10) -> Candle:

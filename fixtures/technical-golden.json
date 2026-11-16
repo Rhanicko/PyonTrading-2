@@ -1,0 +1,42 @@
+{
+  "timeframe_seconds": 300,
+  "expected": {
+    "completed_count": 31,
+    "rsi_14": 55.35042789802007,
+    "atr_14": 2.664185218102176
+  },
+  "candles": [
+    { "open_time_utc": "2026-10-20T00:00:00Z", "open": 100.0, "high": 101.8, "low": 99.1, "close": 100.7, "tick_volume": 80, "completed": true },
+    { "open_time_utc": "2026-10-20T00:05:00Z", "open": 100.7, "high": 103.2, "low": 100.2, "close": 102.5, "tick_volume": 82, "completed": true },
+    { "open_time_utc": "2026-10-20T00:10:00Z", "open": 102.5, "high": 103.0, "low": 100.8, "close": 101.4, "tick_volume": 79, "completed": true },
+    { "open_time_utc": "2026-10-20T00:15:00Z", "open": 101.4, "high": 104.6, "low": 101.0, "close": 103.9, "tick_volume": 86, "completed": true },
+    { "open_time_utc": "2026-10-20T00:20:00Z", "open": 103.9, "high": 105.1, "low": 102.9, "close": 103.2, "tick_volume": 84, "completed": true },
+    { "open_time_utc": "2026-10-20T00:25:00Z", "open": 103.2, "high": 104.0, "low": 101.6, "close": 102.1, "tick_volume": 83, "completed": true },
+    { "open_time_utc": "2026-10-20T00:30:00Z", "open": 102.1, "high": 104.8, "low": 101.9, "close": 104.2, "tick_volume": 91, "completed": true },
+    { "open_time_utc": "2026-10-20T00:35:00Z", "open": 104.2, "high": 106.0, "low": 103.6, "close": 105.4, "tick_volume": 94, "completed": true },
+    { "open_time_utc": "2026-10-20T00:40:00Z", "open": 105.4, "high": 105.9, "low": 103.4, "close": 103.8, "tick_volume": 88, "completed": true },
+    { "open_time_utc": "2026-10-20T00:45:00Z", "open": 103.8, "high": 104.5, "low": 102.0, "close": 102.7, "tick_volume": 85, "completed": true },
+    { "open_time_utc": "2026-10-20T00:50:00Z", "open": 102.7, "high": 105.4, "low": 102.3, "close": 104.9, "tick_volume": 96, "completed": true },
+    { "open_time_utc": "2026-10-20T00:55:00Z", "open": 104.9, "high": 107.0, "low": 104.2, "close": 106.3, "tick_volume": 102, "completed": true },
+    { "open_time_utc": "2026-10-20T01:00:00Z", "open": 106.3, "high": 106.7, "low": 104.4, "close": 105.0, "tick_volume": 95, "completed": true },
+    { "open_time_utc": "2026-10-20T01:05:00Z", "open": 105.0, "high": 105.8, "low": 103.1, "close": 103.6, "tick_volume": 90, "completed": true },
+    { "open_time_utc": "2026-10-20T01:10:00Z", "open": 103.6, "high": 104.0, "low": 101.5, "close": 102.2, "tick_volume": 87, "completed": true },
+    { "open_time_utc": "2026-10-20T01:15:00Z", "open": 102.2, "high": 104.2, "low": 101.8, "close": 103.7, "tick_volume": 92, "completed": true },
+    { "open_time_utc": "2026-10-20T01:20:00Z", "open": 103.7, "high": 106.4, "low": 103.0, "close": 105.8, "tick_volume": 104, "completed": true },
+    { "open_time_utc": "2026-10-20T01:25:00Z", "open": 105.8, "high": 107.8, "low": 105.2, "close": 107.1, "tick_volume": 108, "completed": true },
+    { "open_time_utc": "2026-10-20T01:30:00Z", "open": 107.1, "high": 107.6, "low": 105.1, "close": 105.6, "tick_volume": 99, "completed": true },
+    { "open_time_utc": "2026-10-20T01:35:00Z", "open": 105.6, "high": 106.2, "low": 103.6, "close": 104.1, "tick_volume": 93, "completed": true },
+    { "open_time_utc": "2026-10-20T01:40:00Z", "open": 104.1, "high": 105.0, "low": 102.2, "close": 102.9, "tick_volume": 89, "completed": true },
+    { "open_time_utc": "2026-10-20T01:45:00Z", "open": 102.9, "high": 104.8, "low": 102.5, "close": 104.0, "tick_volume": 91, "completed": true },
+    { "open_time_utc": "2026-10-20T01:50:00Z", "open": 104.0, "high": 106.7, "low": 103.7, "close": 106.0, "tick_volume": 103, "completed": true },
+    { "open_time_utc": "2026-10-20T01:55:00Z", "open": 106.0, "high": 108.0, "low": 105.3, "close": 107.2, "tick_volume": 107, "completed": true },
+    { "open_time_utc": "2026-10-20T02:00:00Z", "open": 107.2, "high": 107.5, "low": 105.2, "close": 105.9, "tick_volume": 97, "completed": true },
+    { "open_time_utc": "2026-10-20T02:05:00Z", "open": 105.9, "high": 106.8, "low": 103.8, "close": 104.4, "tick_volume": 92, "completed": true },
+    { "open_time_utc": "2026-10-20T02:10:00Z", "open": 104.4, "high": 104.9, "low": 102.5, "close": 103.2, "tick_volume": 88, "completed": true },
+    { "open_time_utc": "2026-10-20T02:15:00Z", "open": 103.2, "high": 105.3, "low": 102.8, "close": 104.7, "tick_volume": 94, "completed": true },
+    { "open_time_utc": "2026-10-20T02:20:00Z", "open": 104.7, "high": 107.1, "low": 104.0, "close": 106.5, "tick_volume": 106, "completed": true },
+    { "open_time_utc": "2026-10-20T02:25:00Z", "open": 106.5, "high": 108.4, "low": 105.8, "close": 107.8, "tick_volume": 110, "completed": true },
+    { "open_time_utc": "2026-10-20T02:30:00Z", "open": 107.8, "high": 108.2, "low": 105.6, "close": 106.1, "tick_volume": 98, "completed": true },
+    { "open_time_utc": "2026-10-20T02:35:00Z", "open": 106.1, "high": 250.0, "low": 1.0, "close": 240.0, "tick_volume": 9999, "completed": false }
+  ]
+}

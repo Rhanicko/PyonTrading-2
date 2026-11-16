@@ -1,0 +1,14 @@
+:root {
+  color-scheme: dark;
+  --surface: #0d151e;
+  --surface-raised: #111d28;
+  --surface-muted: #0a1118;
+  --line: #233442;
+  --line-soft: rgba(122, 153, 168, .18);
+  --ink: #edf5f6;
+  --muted: #8ca1aa;
+  --live: #63e5ba;
+  --accent: #74c9ff;
+  --warning: #f3c968;
+  --danger: #ff8e86;
+}

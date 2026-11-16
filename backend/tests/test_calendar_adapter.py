@@ -22,6 +22,17 @@ class FakeResponse:
         return self.payload
 
 
+def test_calendar_risk_window_keeps_recent_releases_and_events_beyond_display_limit():
+    now = datetime(2026, 11, 16, 12, tzinfo=UTC)
+    events = [CalendarEvent(title=f"event-{minutes}", currency="USD", impact="High" if minutes in {-10, 60} else "Low",
+                            event_time_utc=now + timedelta(minutes=minutes), event_time_manila=now + timedelta(minutes=minutes),
+                            source_url=FOREX_FACTORY_CALENDAR_PAGE) for minutes in [-10, 1, 2, 3, 4, 5, 60]]
+    source = EventsResponse(observed_at_utc=now, data_status=DataStatus.LIVE, events=events, source_url=FOREX_FACTORY_CALENDAR_PAGE)
+    result = ForexFactoryCalendarAdapter._filtered_response(source, now, limit=5, today_only=False)
+    assert [event.title for event in result.events] == ["event-1", "event-2", "event-3", "event-4", "event-5"]
+    assert {event.title for event in result.risk_events} == {"event--10", "event-60"}
+
+
 def test_calendar_filters_usd_events_and_converts_to_manila(monkeypatch):
     payload = b'[{"title":"CPI m/m","country":"USD","date":"2099-01-02T08:30:00-05:00","impact":"High","forecast":"0.2%","previous":"0.1%"},{"title":"Ignored","country":"EUR","date":"2099-01-02T08:30:00-05:00","impact":"High"}]'
     monkeypatch.setattr("app.adapters.calendar.urlopen", lambda *_args, **_kwargs: FakeResponse(payload))

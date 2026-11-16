@@ -30,26 +30,32 @@ class OfficialMacroScheduleAdapter:
         self._cache: dict[str, OfficialMacroSource] = {}
         self._fetched_at: datetime | None = None
         self._lock = Lock()
+        self._refresh_lock = Lock()
 
     def snapshot(self) -> list[OfficialMacroSource]:
         with self._lock:
             now = datetime.now(UTC)
             if self._fetched_at is None:
                 return [self._pending(provider, url, now) for provider, url in _PROVIDERS]
-            return [self._cache.get(provider, self._pending(provider, url, now)) for provider, url in _PROVIDERS]
+            sources = [self._cache.get(provider, self._pending(provider, url, now)) for provider, url in _PROVIDERS]
+            if (now - self._fetched_at).total_seconds() >= self.ttl_seconds:
+                sources = [source.model_copy(update={"data_status": DataStatus.DELAYED, "reason_codes": [*source.reason_codes, "OFFICIAL_SCHEDULE_CACHE_EXPIRED"]}) if source.data_status == DataStatus.LIVE else source for source in sources]
+            return sources
 
     def refresh_if_due(self) -> list[OfficialMacroSource]:
-        with self._lock:
+        with self._refresh_lock:
             now = datetime.now(UTC)
-            if self._fetched_at and (now - self._fetched_at).total_seconds() < self.ttl_seconds:
-                return [self._cache.get(provider, self._pending(provider, url, now)) for provider, url in _PROVIDERS]
+            with self._lock:
+                if self._fetched_at and (now - self._fetched_at).total_seconds() < self.ttl_seconds:
+                    return [self._cache.get(provider, self._pending(provider, url, now)) for provider, url in _PROVIDERS]
             results = {
                 "BLS": self._fetch_bls(now),
                 "BEA": self._fetch_html_provider("BEA", BEA_SCHEDULE_URL, now),
                 "FEDERAL_RESERVE": self._fetch_html_provider("FEDERAL_RESERVE", FEDERAL_RESERVE_FOMC_URL, now),
             }
-            self._cache = results
-            self._fetched_at = now
+            with self._lock:
+                self._cache = results
+                self._fetched_at = now
             return [results[provider] for provider, _url in _PROVIDERS]
 
     @staticmethod

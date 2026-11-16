@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 
 from app.analysis.quality import assess_data_quality, classify_session_and_regime
+from app.analysis.confluence import validate_top_down
 from app.analysis.professional import professional_research
 from app.analysis.technical import analyze_completed_candles
 from app.adapters.calendar import ForexFactoryCalendarAdapter
 from app.adapters.official_macro import OfficialMacroScheduleAdapter
 from app.adapters.mt5 import MT5Adapter
-from app.schemas.market import Candle, DataQualityReport, DataStatus, EventsResponse, LiveResearchWatchResponse, MarketAnalysisResponse, MarketDepthReport, OperationsStatus, PaperTradingReport, ProfessionalResearchReport, ResearchBotReport, ResearchResponse, StrategyEnsemble, StrategyVote, TechnicalIndicators, TimeframeEvidence
+from app.schemas.market import Candle, DataQualityReport, DataStatus, EventsResponse, LiveResearchWatchResponse, MarketAnalysisResponse, MarketDepthReport, OperationsStatus, PaperTradingReport, ProfessionalResearchReport, QuoteResponse, ResearchBotReport, ResearchReferenceLevels, ResearchResponse, ResearchSignalProof, ResearchSignalProofCheck, StrategyEnsemble, StrategyVote, TechnicalIndicators, TimeframeEvidence
 from app.services.cross_market import CrossMarketContextService
 from app.storage.database import (
     count_research_evidence,
@@ -30,6 +32,7 @@ class TimeframeSpec:
     duration: timedelta
     required_completed_candles: int
     window_label: str
+    indicator_warmup_candles: int = 180
 
 
 # Every window has enough completed candles for the MA60 context and the
@@ -39,6 +42,11 @@ TIMEFRAME_SPECS = (
     TimeframeSpec("M15", timedelta(minutes=15), 96, "24h"),
     TimeframeSpec("H1", timedelta(hours=1), 72, "3d"),
     TimeframeSpec("H4", timedelta(hours=4), 60, "10d"),
+)
+
+AUXILIARY_TIMEFRAME_SPECS = (
+    TimeframeSpec("D1", timedelta(days=1), 60, "60 broker days"),
+    TimeframeSpec("M1", timedelta(minutes=1), 60, "1h"),
 )
 
 
@@ -69,6 +77,9 @@ class TimeframeAssessment:
     total_gaps: int = 0
     indicators: TechnicalIndicators | None = None
     window: tuple[Candle, ...] = ()
+    setup_kind: str | None = None
+    setup_known_at_utc: datetime | None = None
+    invalidation_price: float | None = None
 
 
 class ResearchCoordinator:
@@ -94,9 +105,10 @@ class ResearchCoordinator:
         calendar_response: EventsResponse | None = None,
         *,
         persist_evidence: bool = True,
+        quote_snapshot: QuoteResponse | None = None,
     ) -> ResearchResponse:
         now = datetime.now(UTC)
-        quote = self.adapter.quote(symbol)
+        quote = quote_snapshot if quote_snapshot is not None else self.adapter.quote(symbol)
         chart_bot, anchor, chart_evidence = self._chart_bot(symbol, now)
         macro_sources = self.official_macro.snapshot() if self.official_macro else []
         calendar_bot, calendar_state = self._calendar_bot(now, calendar_response, macro_sources)
@@ -144,7 +156,12 @@ class ResearchCoordinator:
             evidence_count = count_research_evidence(self.database_path, symbol)
             strategy_bot = self._strategy_bot(now, chart_bot, calendar_bot, quality_bot, ensemble, evidence_count)
 
-        broker_ready = chart_bot.data_status == DataStatus.LIVE and chart_bot.state != "BLOCKED" and quality.status != "BLOCK"
+        broker_ready = (
+            quote.data_status == DataStatus.LIVE
+            and chart_bot.data_status == DataStatus.LIVE
+            and chart_bot.state != "BLOCKED"
+            and quality.status != "BLOCK"
+        )
         market_state = "DATA UNAVAILABLE"
         if broker_ready:
             market_state = "NO TRADE"
@@ -156,7 +173,10 @@ class ResearchCoordinator:
         research = ResearchResponse(
             observed_at_utc=now,
             source_timestamp_utc=self._conservative_source_timestamp(chart_evidence, chart_bot.source_timestamp_utc),
-            data_status=DataStatus.LIVE if broker_ready else chart_bot.data_status,
+            data_status=(
+                quote.data_status if quote.data_status != DataStatus.LIVE
+                else DataStatus.LIVE if broker_ready else chart_bot.data_status
+            ),
             reason_codes=[*ensemble.reason_codes, "STRATEGY_VALIDATION_REQUIRED", "CONFIDENCE_WITHHELD"],
             symbol=symbol,
             market_state=market_state,
@@ -172,102 +192,59 @@ class ResearchCoordinator:
             professional_analysis=professional,
             operations=OperationsStatus(**read_operations_status(self.database_path)),
         )
+        gates = self._research_gates(quote, chart_bot, chart_evidence, calendar_bot, calendar_state, quality, professional)
+        auxiliary = tuple(self._timeframe_assessment(symbol, spec, now=now) for spec in AUXILIARY_TIMEFRAME_SPECS)
+        top_down = validate_top_down(
+            [*research.analysis_timeframes, *self._public_timeframe_evidence_from_assessments(auxiliary)],
+            observed_at=now, risk_clear=all(gate["state"] == "PASS" for gate in gates),
+        )
+        research = research.model_copy(update={"top_down": top_down})
         return research.model_copy(update={
             "live_research_watch": self._build_live_research_watch(
                 research,
-                self._research_gates(quote, chart_bot, chart_evidence, calendar_bot, calendar_state, quality, professional),
+                gates,
+                quote=quote,
+                chart=chart_evidence,
             ),
         })
 
     def analyze_market(self, symbol: str | None) -> MarketAnalysisResponse:
-        """Run the versioned research screen against fresh, source-backed inputs.
-
-        This is intentionally a watchlist screen, not execution logic. It never
-        produces price levels, sizing, or an order instruction.
-        """
-        now = datetime.now(UTC)
-        quote = self.adapter.quote(symbol)
-        chart_bot, anchor, chart = self._chart_bot(symbol, now)
-        macro_sources = self.official_macro.snapshot() if self.official_macro else []
-        calendar_bot, calendar_state = self._calendar_bot(now, macro_sources=macro_sources)
-        primary_window = list(chart.primary.window) if chart else []
-        quality = assess_data_quality(quote, primary_window, timeframe=TIMEFRAME_SPECS[0].duration, now=now)
-        quality = self._with_session_transition(symbol, quality)
-        regime = classify_session_and_regime(
-            primary_window,
-            structure=chart.structure if chart else "UNAVAILABLE",
-            spread_state=quality.spread_state,
-            now=now,
-        )
-        ensemble = self._strategy_ensemble(symbol, chart, quality, calendar_state)
-        context = self.cross_market.snapshot() if self.cross_market else []
-        professional = self._professional_analysis(
-            symbol, quote, primary_window, calendar_state,
-            cross_market_available=any(item.data_status == DataStatus.LIVE for item in context),
-            data_quality=quality,
-        )
-
-        quote_live = quote.data_status == DataStatus.LIVE
-        chart_ready = chart is not None and chart_bot.data_status == DataStatus.LIVE
-        calendar_live = calendar_bot.data_status == DataStatus.LIVE
-        integrity_eligible = quality.status != "BLOCK" and quality.spread_state != "ELEVATED"
-        event_risk_clear = calendar_state not in {"HIGH_IMPACT_WINDOW", "ELEVATED_EVENT_WINDOW", "UNVERIFIED"}
-        gates = self._research_gates(quote, chart_bot, chart, calendar_bot, calendar_state, quality, professional)
-        facts = [
-            f"Chart bot: {chart_bot.summary}",
-            f"News bot: {calendar_bot.summary}",
-            f"Session/regime: {regime.session_label} / {regime.market_regime} / {regime.volatility_regime}.",
-            "Screen: completed candles and current source status only; no execution logic.",
-        ]
-        status = quote.data_status if not quote_live else (chart_bot.data_status if not chart_ready else calendar_bot.data_status)
-        source_timestamp = self._conservative_source_timestamp(chart, quote.source_timestamp_utc)
-
-        risk_reviewable = professional.risk_engine.state == "REVIEW_REQUIRED"
-        if not (quote_live and integrity_eligible and chart_ready and calendar_live and event_risk_clear and risk_reviewable):
-            reasons = ["RESEARCH_SCREEN_GATES_NOT_MET", "NO_ORDER_EXECUTION"]
-            return MarketAnalysisResponse(
-                observed_at_utc=now, source_timestamp_utc=source_timestamp, data_status=status,
-                reason_codes=reasons, symbol=symbol, market_context=chart.structure if chart else "UNAVAILABLE",
-                summary="No trade: one or more live-source, completed multi-timeframe, or event-risk gates are not clear.",
-                gates=gates, analysis_timeframes=self._public_timeframe_evidence(chart), supporting_facts=facts,
-                data_quality=quality, session_regime=regime, cross_market=context,
-                official_macro_sources=macro_sources, event_risk_state=calendar_state,
-                strategy_ensemble=ensemble, professional_analysis=professional,
-                paper_trading=PaperTradingReport(
-                    reason_codes=["BACKGROUND_COMPLETED_CANDLE_CYCLE_REQUIRED", "NO_ORDER_EXECUTION"],
-                ),
-            )
-
-        primary = chart.primary
-        decision = ensemble.decision
-        quality_note = " A data-quality watch remains visible in this research result." if quality.status == "WATCH" else ""
-        if decision == "WATCH_LONG":
-            summary = "Watch-long research condition: independent completed-candle structure and momentum rules agree. This is not an execution instruction." + quality_note
-            reasons = ["RESEARCH_SCREEN_V4_PROFESSIONAL_MODULES", "WATCH_CONDITION_MET", "UNVALIDATED_RESEARCH_SIGNAL", "NO_ORDER_EXECUTION"]
-        elif decision == "WATCH_SHORT":
-            summary = "Watch-short research condition: independent completed-candle structure and momentum rules agree. This is not an execution instruction." + quality_note
-            reasons = ["RESEARCH_SCREEN_V4_PROFESSIONAL_MODULES", "WATCH_CONDITION_MET", "UNVALIDATED_RESEARCH_SIGNAL", "NO_ORDER_EXECUTION"]
+        """Save an on-demand review of the same evidence and gates used by the live watch."""
+        research = self.snapshot(symbol, persist_evidence=False)
+        watch = research.live_research_watch
+        ensemble = research.strategy_ensemble
+        decision = ensemble.decision if (
+            ensemble and watch and watch.lifecycle == "ACTIVE_RESEARCH_WATCH"
+            and research.top_down and research.top_down.state == "CONFIRMED"
+        ) else "NO_TRADE"
+        structures = {item.structure for item in research.analysis_timeframes}
+        context = next(iter(structures)) if len(structures) == 1 else "MIXED_STRUCTURE"
+        if not research.analysis_timeframes or any(item.data_status != DataStatus.LIVE for item in research.analysis_timeframes):
+            context = "UNAVAILABLE"
+        bots = {bot.bot_id: bot for bot in research.bots}
+        facts = [f"Chart bot: {bots['chart'].summary}", f"News bot: {bots['calendar'].summary}"]
+        if research.session_regime:
+            regime = research.session_regime
+            facts.append(f"Session/regime: {regime.session_label} / {regime.market_regime} / {regime.volatility_regime}.")
+        facts.append("Review uses the shared automatic evidence snapshot and top-down gates.")
+        reasons = ["RESEARCH_SCREEN_V5_SHARED_TOP_DOWN", "NO_ORDER_EXECUTION"]
+        if decision == "NO_TRADE":
+            reasons.append("SHARED_RESEARCH_GATES_NOT_MET")
+            summary = "No trade: required top-down confirmations, source integrity, risk checks or rule agreement are incomplete."
         else:
-            summary = "No trade: the independent deterministic rules do not reach the required agreement, or validation remains incomplete."
-            reasons = ["RESEARCH_SCREEN_V4_PROFESSIONAL_MODULES", "ENSEMBLE_ABSTENTION", "NO_ORDER_EXECUTION"]
-
-        facts.extend([
-            f"Multi-timeframe structure: {chart.structure.replace('_', ' ').title()}",
-            (
-                f"M5 range position: {primary.close_location:.0f}%; recent up/down closes: "
-                f"{primary.recent_up_closes}/{primary.recent_down_closes}"
-            ),
-            f"M5 moving-average context: {primary.moving_average_context}",
-        ])
+            reasons.extend(["WATCH_CONDITION_MET", "UNVALIDATED_RESEARCH_SIGNAL"])
+            summary = "Directional research context passes the shared top-down review; publication proof and performance remain separate."
         return MarketAnalysisResponse(
-            observed_at_utc=now, source_timestamp_utc=source_timestamp, data_status=DataStatus.LIVE,
-            reason_codes=reasons, symbol=symbol, decision=decision, market_context=chart.structure,
-            summary=summary, gates=gates, analysis_timeframes=self._public_timeframe_evidence(chart), supporting_facts=facts,
-            data_quality=quality, session_regime=regime, cross_market=context,
-            official_macro_sources=macro_sources, event_risk_state=calendar_state,
-            strategy_ensemble=ensemble, professional_analysis=professional,
+            observed_at_utc=research.observed_at_utc, source_timestamp_utc=research.source_timestamp_utc,
+            data_status=research.data_status, reason_codes=reasons, symbol=symbol, decision=decision,
+            market_context=context, summary=summary, gates=watch.gates if watch else [],
+            analysis_timeframes=research.analysis_timeframes, supporting_facts=facts,
+            data_quality=research.data_quality, session_regime=research.session_regime,
+            cross_market=research.cross_market, official_macro_sources=research.official_macro_sources,
+            event_risk_state=research.event_risk_state, strategy_ensemble=ensemble,
+            professional_analysis=research.professional_analysis, top_down=research.top_down,
             paper_trading=PaperTradingReport(
-                expected_spread_points=quote.spread_points,
+                expected_spread_points=research.data_quality.spread_points if research.data_quality else None,
                 reason_codes=["BACKGROUND_COMPLETED_CANDLE_CYCLE_REQUIRED", "COMMISSION_UNAVAILABLE", "SLIPPAGE_UNAVAILABLE", "NO_ORDER_EXECUTION"],
             ),
         )
@@ -276,9 +253,8 @@ class ResearchCoordinator:
         """Return the current automatic research-watch lifecycle without persisting a user review.
 
         The decision is recalculated from current source status and completed
-        candles.  It intentionally exposes no entry, target, stop, sizing, or
-        probability because this workstation is research-only and the rules
-        have not been promoted through chronological validation.
+        candles. Any reference levels are unvalidated context, not an order,
+        size, probability, or performance claim.
         """
         research = self.snapshot(symbol, persist_evidence=False)
         if research.live_research_watch is not None:
@@ -289,6 +265,9 @@ class ResearchCoordinator:
         self,
         research: ResearchResponse,
         gates: list[dict[str, str]],
+        *,
+        quote: QuoteResponse | None = None,
+        chart: ChartEvidence | None = None,
     ) -> LiveResearchWatchResponse:
         """Build an automatic watch from one already-read research snapshot.
 
@@ -310,10 +289,13 @@ class ResearchCoordinator:
         has_completed_evidence = bool(m5 and m5.data_status == DataStatus.LIVE)
         has_live_sources = research.data_status == DataStatus.LIVE and has_completed_evidence
 
+        publication_stopped = bool(research.operations and (research.operations.kill_switch_enabled or not research.operations.research_pipeline_enabled))
         if not has_live_sources:
             lifecycle = "UNAVAILABLE"
         elif expired:
             lifecycle = "EXPIRED"
+        elif publication_stopped:
+            lifecycle = "WITHHELD"
         elif ensemble and ensemble.decision in {"WATCH_LONG", "WATCH_SHORT"}:
             lifecycle = "ACTIVE_RESEARCH_WATCH"
         else:
@@ -324,11 +306,22 @@ class ResearchCoordinator:
             for gate in gates
             if gate["state"] == "BLOCK"
         ]
+        if publication_stopped:
+            blocked_gates.insert(0, "Automatic research publication is stopped by the local operator.")
         score = self._watch_evidence_score_from_research(research)
         horizon, horizon_basis, horizon_review_at, horizon_reason_codes = self._research_horizon(
             research,
             lifecycle=lifecycle,
             direction=direction,
+        )
+        reference_levels, levels_reason = self._reference_levels(
+            quote, chart, direction if lifecycle == "ACTIVE_RESEARCH_WATCH" and research.top_down and research.top_down.state == "CONFIRMED" else "NONE",
+            gates, research.observed_at_utc,
+        )
+        if lifecycle == "ACTIVE_RESEARCH_WATCH" and research.top_down and research.top_down.state != "CONFIRMED":
+            levels_reason = "TOP_DOWN_CONFIRMATION_REQUIRED"
+        signal_proof = self._signal_proof(
+            research, quote, chart, lifecycle, direction, gates, reference_levels,
         )
         invalidation_conditions = [
             "A newer completed M5 candle triggers the next deterministic review.",
@@ -346,7 +339,7 @@ class ResearchCoordinator:
                 "It is not a trade instruction, probability, or performance claim."
             )
         else:
-            summary = "Automatic research watch is withheld because the independent rules or safety gates do not currently support a directional research watch."
+            summary = "Automatic research watch is withheld because the deterministic readers or safety gates do not currently support a directional research watch."
             invalidation_conditions = blocked_gates or [
                 "Independent completed-candle rules must reach the required agreement.",
                 *invalidation_conditions,
@@ -370,6 +363,9 @@ class ResearchCoordinator:
             horizon_review_at_utc=horizon_review_at,
             horizon_reason_codes=horizon_reason_codes,
             evidence_score=score,
+            reference_levels=reference_levels,
+            reference_levels_reason=levels_reason,
+            signal_proof=signal_proof,
             active_from_utc=m5.source_timestamp_utc if m5 else None,
             scheduled_review_at_utc=scheduled_review_at,
             expires_at_utc=scheduled_review_at,
@@ -377,10 +373,146 @@ class ResearchCoordinator:
             invalidation_conditions=invalidation_conditions,
             gates=gates,
             analysis_timeframes=research.analysis_timeframes,
+            top_down=research.top_down,
             data_quality=research.data_quality,
             event_risk_state=research.event_risk_state,
             strategy_ensemble=ensemble,
         )
+
+    @staticmethod
+    def _signal_proof(
+        research: ResearchResponse,
+        quote: QuoteResponse | None,
+        chart: ChartEvidence | None,
+        lifecycle: str,
+        direction: str,
+        gates: list[dict[str, str]],
+        levels: ResearchReferenceLevels | None,
+    ) -> ResearchSignalProof:
+        """Publish only source-backed research alerts; never infer a win probability."""
+        observed_at = research.observed_at_utc
+        quote_age = (observed_at - quote.observed_at_utc).total_seconds() if quote else None
+        quote_fresh = bool(
+            quote and quote.data_status == DataStatus.LIVE
+            and quote.tick_age_seconds is not None and 0 <= quote.tick_age_seconds <= 5
+            and quote_age is not None and -2 <= quote_age <= 5
+            and quote.bid is not None and quote.ask is not None
+        )
+        timeframes = {item.timeframe: item for item in research.analysis_timeframes}
+        aligned = [timeframes.get(timeframe) for timeframe in ("M5", "M15", "H1")]
+        structures = {item.structure for item in aligned if item is not None}
+        expected_structure = "UPWARD_STRUCTURE" if direction == "LONG_CONTEXT" else "DOWNWARD_STRUCTURE" if direction == "SHORT_CONTEXT" else None
+        completed_context = (
+            all(
+                item is not None and item.data_status == DataStatus.LIVE
+                and item.source_timestamp_utc is not None
+                and item.completed_candles >= item.required_completed_candles
+                for item in aligned
+            )
+            and len(structures) == 1
+            and structures <= {"UPWARD_STRUCTURE", "DOWNWARD_STRUCTURE"}
+            and (expected_structure is None or expected_structure in structures)
+        )
+        quality = research.data_quality
+        calendar = next((bot for bot in research.bots if bot.bot_id == "calendar"), None)
+        ensemble = research.strategy_ensemble
+        expected_vote = "WATCH_LONG" if direction == "LONG_CONTEXT" else "WATCH_SHORT"
+        opposing_vote = "WATCH_SHORT" if expected_vote == "WATCH_LONG" else "WATCH_LONG"
+        aligned_votes = [vote for vote in ensemble.votes if vote.decision == expected_vote] if ensemble else []
+        no_opposition = bool(
+            ensemble and lifecycle == "ACTIVE_RESEARCH_WATCH"
+            and ensemble.decision == expected_vote
+            and len(aligned_votes) >= ensemble.required_agreement_count
+            and not any(vote.decision == opposing_vote for vote in ensemble.votes)
+        )
+        m5_atr = timeframes.get("M5").indicators.atr_14 if timeframes.get("M5") and timeframes["M5"].indicators else None
+        spread = quote.ask - quote.bid if quote and quote.ask is not None and quote.bid is not None else None
+        reported_spread = quote.spread_points * quote.point if quote and quote.spread_points is not None and quote.point else None
+        spread_buffer_clear = bool(
+            spread is not None and reported_spread is not None and m5_atr is not None
+            and isfinite(spread) and isfinite(reported_spread) and isfinite(m5_atr)
+            and spread > 0 and m5_atr > 0
+            and abs(spread - reported_spread) <= quote.point * 1.5
+            and spread <= m5_atr * 0.25
+        )
+        completed_m5 = chart.primary.window if chart else ()
+        close_triggered = ResearchCoordinator._completed_close_breakout(completed_m5, direction)
+        checks = [
+            ResearchSignalProofCheck(code="FRESH_BROKER_QUOTE", passed=quote_fresh, detail="Live bid/ask and broker tick age at the decision time"),
+            ResearchSignalProofCheck(code="COMPLETED_MTF_ALIGNMENT", passed=completed_context, detail="Completed M5, M15 and H1 broker-candle structures align"),
+            ResearchSignalProofCheck(code="DATA_QUALITY_CLEAR", passed=bool(quality and quality.status == "CLEAR" and quality.spread_state == "NORMAL"), detail="Integrity clear and spread within observed range"),
+            ResearchSignalProofCheck(code="CALENDAR_RISK_CHECKED", passed=bool(calendar and calendar.data_status == DataStatus.LIVE and calendar.source_url and research.event_risk_state in {"NO_EVENT_IN_EXPORT", "UPCOMING_USD_EVENT"}), detail="Source-labelled USD calendar has no known elevated window; absence is not guaranteed"),
+            ResearchSignalProofCheck(code="RULE_AGREEMENT_NO_OPPOSITION", passed=no_opposition, detail="At least two deterministic rules agree and none votes the opposite way"),
+            ResearchSignalProofCheck(code="CENTRAL_RISK_GATE", passed=bool(gates) and all(gate["state"] == "PASS" for gate in gates), detail="All central research gates pass at this snapshot"),
+            ResearchSignalProofCheck(code="SOURCE_BACKED_LEVELS", passed=bool(levels and quote and levels.quote_observed_at_utc == quote.observed_at_utc and timeframes.get("M5") and levels.source_candle_close_utc == timeframes["M5"].source_timestamp_utc), detail="Indicative levels use this quote and completed M5 ATR"),
+            ResearchSignalProofCheck(code="SPREAD_BUFFER_WITHIN_ATR", passed=spread_buffer_clear, detail="Broker bid/ask spread agrees with reported points and is at most 25% of completed M5 ATR; this heuristic is not performance validated"),
+            ResearchSignalProofCheck(code="COMPLETED_CLOSE_TRIGGER", passed=close_triggered, detail="Latest completed M5 close breaks the prior 20 completed closes in the research direction; continuation heuristic, not a fill"),
+            ResearchSignalProofCheck(code="TOP_DOWN_CONFIRMATION", passed=bool(research.top_down and research.top_down.state == "CONFIRMED"), detail="D1/H4 bias, H1 direction, M15 setup, M5 completed trigger and risk gates; M1 is optional timing"),
+            ResearchSignalProofCheck(code="OPERATIONS_ALLOW_PUBLICATION", passed=bool(research.operations and not research.operations.kill_switch_enabled and research.operations.research_pipeline_enabled), detail="Research worker enabled and emergency stop clear at this review"),
+        ]
+        failed = [check.code for check in checks if not check.passed]
+        return ResearchSignalProof(
+            publication_state="WITHHELD" if failed else "ELIGIBLE",
+            checks=checks,
+            rule_versions=[vote.strategy_version for vote in aligned_votes],
+            reason_codes=[*failed, "PERFORMANCE_UNVALIDATED", "NO_ORDER_EXECUTION"],
+        )
+
+    @staticmethod
+    def _completed_close_breakout(candles: tuple[Candle, ...], direction: str) -> bool:
+        recent = candles[-21:]
+        if len(recent) != 21 or not all(candle.completed for candle in recent):
+            return False
+        if direction in {"LONG_CONTEXT", "WATCH_LONG"}:
+            return recent[-1].close > max(candle.close for candle in recent[:-1])
+        if direction in {"SHORT_CONTEXT", "WATCH_SHORT"}:
+            return recent[-1].close < min(candle.close for candle in recent[:-1])
+        return False
+
+    @staticmethod
+    def _reference_levels(
+        quote: QuoteResponse | None,
+        chart: ChartEvidence | None,
+        direction: str,
+        gates: list[dict[str, str]],
+        observed_at: datetime,
+    ) -> tuple[ResearchReferenceLevels | None, str]:
+        """Describe an unvalidated 1R/2R scenario only for a fresh, active watch."""
+        if direction == "NONE" or any(gate["state"] == "BLOCK" for gate in gates):
+            return None, "NO_ACTIVE_DIRECTIONAL_RESEARCH_WATCH"
+        if not quote or quote.data_status != DataStatus.LIVE or quote.bid is None or quote.ask is None:
+            return None, "LIVE_BROKER_QUOTE_REQUIRED"
+        if quote.tick_age_seconds is None or quote.tick_age_seconds > 5 or (observed_at - quote.observed_at_utc).total_seconds() > 5:
+            return None, "FRESH_BROKER_QUOTE_REQUIRED"
+        primary = chart.primary if chart else None
+        atr = primary.indicators.atr_14 if primary and primary.indicators else None
+        if not primary or not primary.anchor or not atr or not isfinite(atr) or atr <= 0 or not primary.source_timestamp_utc:
+            return None, "COMPLETED_M5_ATR_REQUIRED"
+        entry = quote.ask if direction == "LONG_CONTEXT" else quote.bid
+        if not isfinite(entry) or entry <= 0 or abs(entry - primary.anchor.close) > atr:
+            return None, "QUOTE_OUTSIDE_COMPLETED_M5_ATR"
+        sign = 1 if direction == "LONG_CONTEXT" else -1
+        step = quote.tick_size or quote.point
+        if not step or not isfinite(step) or step <= 0:
+            return None, "BROKER_TICK_SIZE_REQUIRED"
+        def aligned(value: float) -> float:
+            return round(round(value / step) * step, 8)
+        levels = ResearchReferenceLevels(
+            entry=aligned(entry),
+            stop_loss=aligned(entry - sign * atr),
+            take_profit_1=aligned(entry + sign * atr),
+            take_profit_2=aligned(entry + sign * 2 * atr),
+            source_candle_close_utc=primary.source_timestamp_utc,
+            quote_observed_at_utc=quote.observed_at_utc,
+        )
+        ordered = (
+            levels.stop_loss < levels.entry < levels.take_profit_1 < levels.take_profit_2
+            if sign == 1 else
+            levels.stop_loss > levels.entry > levels.take_profit_1 > levels.take_profit_2
+        )
+        if not ordered:
+            return None, "ATR_BELOW_BROKER_TICK_SIZE"
+        return levels, "UNVALIDATED_REFERENCE_ONLY"
 
     @staticmethod
     def _research_horizon(
@@ -706,15 +838,24 @@ class ResearchCoordinator:
             elif indicators.ema_20 < indicators.ema_60 and indicators.rsi_14 <= 45 and indicators.macd_histogram < 0 and indicators.adx_14 >= 18:
                 momentum_decision = "WATCH_SHORT"
         range_decision = "ABSTAIN"
+        long_breakout = self._completed_close_breakout(primary.window, "WATCH_LONG")
+        short_breakout = self._completed_close_breakout(primary.window, "WATCH_SHORT")
         if primary.close_location is not None and primary.net_change is not None and primary.average_range_20 is not None:
-            if primary.close_location >= 60 and primary.recent_up_closes >= 12 and primary.net_change > primary.average_range_20:
+            if long_breakout and primary.close_location >= 60 and primary.recent_up_closes >= 12 and primary.net_change > primary.average_range_20:
                 range_decision = "WATCH_LONG"
-            elif primary.close_location <= 40 and primary.recent_down_closes >= 12 and abs(primary.net_change) > primary.average_range_20:
+            elif short_breakout and primary.close_location <= 40 and primary.recent_down_closes >= 12 and abs(primary.net_change) > primary.average_range_20:
                 range_decision = "WATCH_SHORT"
+        range_reasons = ["COMPLETED_CANDLES_ONLY"]
+        if range_decision != "ABSTAIN":
+            range_reasons.append("COMPLETED_20_CLOSE_BREAKOUT")
+        elif long_breakout or short_breakout:
+            range_reasons.append("RANGE_CONTEXT_NOT_CONFIRMED")
+        else:
+            range_reasons.append("NO_COMPLETED_CLOSE_BREAKOUT")
         votes = [
             StrategyVote(strategy_id="STRUCTURE_ALIGNMENT", strategy_version="structure-alignment-v1", decision=structure_decision, reason_codes=structure_reasons + ["COMPLETED_CANDLES_ONLY"]),
             StrategyVote(strategy_id="MOMENTUM_ALIGNMENT", strategy_version="momentum-alignment-v1", decision=momentum_decision, reason_codes=["EMA_RSI_MACD_ADX_COMPLETED_CANDLES", "ABSTAIN_ON_DISAGREEMENT"]),
-            StrategyVote(strategy_id="RANGE_BREAKOUT", strategy_version="range-breakout-v1", decision=range_decision, reason_codes=["COMPLETED_CANDLES_ONLY", "ABSTAIN_ON_INCOMPLETE_RANGE_CONTEXT"]),
+            StrategyVote(strategy_id="RANGE_BREAKOUT", strategy_version="range-breakout-v2", decision=range_decision, reason_codes=range_reasons),
         ]
         configured = read_strategy_settings(self.database_path, symbol=symbol)
         votes = [
@@ -734,10 +875,10 @@ class ResearchCoordinator:
             reason_codes = ["ABSTENTION_GATE_ACTIVE", "DATA_QUALITY_OR_EVENT_RISK_BLOCK", "NO_ORDER_EXECUTION"]
         elif long_agreement >= 2:
             decision = "WATCH_LONG"
-            reason_codes = ["TWO_OR_MORE_INDEPENDENT_RULES_AGREE", "UNVALIDATED_RESEARCH_SIGNAL", "NO_ORDER_EXECUTION"]
+            reason_codes = ["TWO_OR_MORE_DETERMINISTIC_RULES_AGREE", "UNVALIDATED_RESEARCH_SIGNAL", "NO_ORDER_EXECUTION"]
         elif short_agreement >= 2:
             decision = "WATCH_SHORT"
-            reason_codes = ["TWO_OR_MORE_INDEPENDENT_RULES_AGREE", "UNVALIDATED_RESEARCH_SIGNAL", "NO_ORDER_EXECUTION"]
+            reason_codes = ["TWO_OR_MORE_DETERMINISTIC_RULES_AGREE", "UNVALIDATED_RESEARCH_SIGNAL", "NO_ORDER_EXECUTION"]
         else:
             decision = "NO_TRADE"
             reason_codes = ["ENSEMBLE_DISAGREEMENT", "ABSTAIN_ON_CONFLICT", "NO_ORDER_EXECUTION"]
@@ -756,11 +897,11 @@ class ResearchCoordinator:
         return [
             StrategyVote(strategy_id="STRUCTURE_ALIGNMENT", strategy_version="structure-alignment-v1", decision="ABSTAIN", reason_codes=[reason]),
             StrategyVote(strategy_id="MOMENTUM_ALIGNMENT", strategy_version="momentum-alignment-v1", decision="ABSTAIN", reason_codes=[reason]),
-            StrategyVote(strategy_id="RANGE_BREAKOUT", strategy_version="range-breakout-v1", decision="ABSTAIN", reason_codes=[reason]),
+            StrategyVote(strategy_id="RANGE_BREAKOUT", strategy_version="range-breakout-v2", decision="ABSTAIN", reason_codes=[reason]),
         ]
 
     def _chart_bot(self, symbol: str | None, now: datetime) -> tuple[ResearchBotReport, Candle | None, ChartEvidence | None]:
-        assessments = tuple(self._timeframe_assessment(symbol, spec) for spec in TIMEFRAME_SPECS)
+        assessments = tuple(self._timeframe_assessment(symbol, spec, now=now) for spec in TIMEFRAME_SPECS)
         unavailable = next((assessment for assessment in assessments if assessment.data_status != DataStatus.LIVE), None)
         public_evidence = self._public_timeframe_evidence_from_assessments(assessments)
 
@@ -834,10 +975,38 @@ class ResearchCoordinator:
             chart_evidence,
         )
 
-    def _timeframe_assessment(self, symbol: str | None, spec: TimeframeSpec) -> TimeframeAssessment:
-        status, reasons, candles = self.adapter.candles(symbol, spec.timeframe, spec.required_completed_candles + 1)
-        completed = sorted((candle for candle in candles if candle.completed), key=lambda candle: candle.open_time_utc)
+    def _timeframe_assessment(self, symbol: str | None, spec: TimeframeSpec, *, now: datetime | None = None) -> TimeframeAssessment:
+        requested_completed_candles = spec.required_completed_candles + spec.indicator_warmup_candles
+        try:
+            status, reasons, candles = self.adapter.candles(symbol, spec.timeframe, requested_completed_candles + 1)
+        except Exception as error:
+            return TimeframeAssessment(spec=spec, data_status=DataStatus.SOURCE_ERROR, reason_codes=("TIMEFRAME_READ_FAILED", type(error).__name__), completed_candles=0, source_timestamp_utc=None)
+        completed = [candle for candle in candles if candle.completed]
         source_timestamp = completed[-1].open_time_utc + spec.duration if completed else None
+        checked_at = now or datetime.now(UTC)
+        forming = next((candle for candle in reversed(candles) if not candle.completed), None)
+        prior_session_context = bool(
+            source_timestamp and forming
+            and source_timestamp <= forming.open_time_utc
+            and forming.open_time_utc <= checked_at < forming.open_time_utc + spec.duration
+            and spec.duration + timedelta(seconds=60) < checked_at - source_timestamp <= timedelta(days=3)
+        )
+        timing_reason = None
+        if any(later.open_time_utc <= earlier.open_time_utc for earlier, later in zip(completed, completed[1:])):
+            timing_reason = "DUPLICATE_OR_UNORDERED_TIMEFRAME"
+        elif source_timestamp and source_timestamp > checked_at + timedelta(seconds=2):
+            timing_reason = "FUTURE_COMPLETED_TIMEFRAME"
+        elif source_timestamp and checked_at - source_timestamp > spec.duration + timedelta(seconds=60) and not prior_session_context:
+            # A live tick does not establish that a broker history window is current.
+            timing_reason = "STALE_COMPLETED_TIMEFRAME"
+        if status == DataStatus.LIVE and timing_reason:
+            return TimeframeAssessment(
+                spec=spec, data_status=DataStatus.STALE if timing_reason == "STALE_COMPLETED_TIMEFRAME" else DataStatus.SOURCE_ERROR,
+                reason_codes=(timing_reason, *reasons), completed_candles=len(completed),
+                source_timestamp_utc=source_timestamp,
+            )
+        if prior_session_context:
+            reasons = [*reasons, "PRIOR_BROKER_SESSION_CONTEXT"]
         if status != DataStatus.LIVE or len(completed) < spec.required_completed_candles:
             assessment_status = DataStatus.HISTORY_INSUFFICIENT if status == DataStatus.LIVE else status
             reason_codes = tuple(reasons) or ("MULTI_TIMEFRAME_WINDOW_INSUFFICIENT",)
@@ -845,12 +1014,23 @@ class ResearchCoordinator:
                 spec=spec,
                 data_status=assessment_status,
                 reason_codes=reason_codes,
-                completed_candles=len(completed),
+                completed_candles=min(len(completed), spec.required_completed_candles),
                 source_timestamp_utc=source_timestamp,
                 anchor=completed[-1] if completed else None,
             )
 
-        window = completed[-spec.required_completed_candles:]
+        if len(completed) < requested_completed_candles:
+            return TimeframeAssessment(
+                spec=spec,
+                data_status=DataStatus.HISTORY_INSUFFICIENT,
+                reason_codes=("INDICATOR_WARMUP_INSUFFICIENT", *reasons),
+                completed_candles=spec.required_completed_candles,
+                source_timestamp_utc=source_timestamp,
+                anchor=completed[-1],
+            )
+
+        indicator_window = completed[-requested_completed_candles:]
+        window = indicator_window[-spec.required_completed_candles:]
         closes = [candle.close for candle in window]
         average_20 = sum(closes[-20:]) / 20
         average_60 = sum(closes[-60:]) / 60
@@ -863,9 +1043,18 @@ class ResearchCoordinator:
         recent_up_closes = sum(candle.close > candle.open for candle in window[-20:])
         recent_down_closes = sum(candle.close < candle.open for candle in window[-20:])
         average_range_20 = sum(candle.high - candle.low for candle in window[-20:]) / 20
-        technical = analyze_completed_candles(window, spec.duration)
+        technical = analyze_completed_candles(indicator_window, spec.duration)
         latest_event = technical.structure_events[-1] if technical.structure_events else None
         active_gaps = sum(gap.invalidated_at is None for gap in technical.fair_value_gaps)
+        close_breakout = self._completed_close_breakout(tuple(window), "WATCH_LONG" if net_change > 0 else "WATCH_SHORT")
+        recent_break = latest_event if (
+            latest_event and latest_event.direction == ("BULLISH" if net_change > 0 else "BEARISH")
+            and timedelta(0) <= source_timestamp - latest_event.known_at <= spec.duration * 3
+        ) else None
+        setup_kind = recent_break.kind if recent_break else "COMPLETED_20_CLOSE_BREAKOUT" if close_breakout else None
+        setup_known_at = recent_break.known_at if recent_break else source_timestamp if close_breakout else None
+        prior = window[-21:-1]
+        invalidation = min(bar.low for bar in prior) if net_change > 0 else max(bar.high for bar in prior)
         if latest > average_20 > average_60 and net_change > 0:
             structure = "UPWARD_STRUCTURE"
             moving_average_context = "close > MA20 > MA60"
@@ -904,6 +1093,9 @@ class ResearchCoordinator:
                 active_fair_value_gaps=active_gaps,
             ),
             window=tuple(window),
+            setup_kind=setup_kind,
+            setup_known_at_utc=setup_known_at,
+            invalidation_price=invalidation if setup_kind else None,
         )
 
     @staticmethod
@@ -925,6 +1117,9 @@ class ResearchCoordinator:
                 structure=assessment.structure,
                 indicators=assessment.indicators,
                 reason_codes=list(assessment.reason_codes),
+                setup_kind=assessment.setup_kind,
+                setup_known_at_utc=assessment.setup_known_at_utc,
+                invalidation_price=assessment.invalidation_price,
             )
             for assessment in assessments
         ]
@@ -952,7 +1147,10 @@ class ResearchCoordinator:
             f"Official {getattr(item, 'provider', 'source')}: {getattr(item, 'data_status', DataStatus.SOURCE_ERROR).value}."
             for item in (macro_sources or [])
         ]
-        next_event = calendar.events[0] if calendar.events else None
+        risk_events = [event for event in [*calendar.risk_events, *calendar.events] if
+                       (event.impact == "High" and -timedelta(minutes=30) <= event.event_time_utc - now <= timedelta(hours=2))
+                       or (event.impact == "Medium" and -timedelta(minutes=15) <= event.event_time_utc - now <= timedelta(hours=1))]
+        next_event = min(risk_events, key=lambda event: (event.impact != "High", abs((event.event_time_utc - now).total_seconds()))) if risk_events else min(calendar.events, key=lambda event: event.event_time_utc, default=None)
         if calendar.data_status not in {DataStatus.LIVE, DataStatus.DELAYED}:
             return (
                 ResearchBotReport(
@@ -976,7 +1174,8 @@ class ResearchCoordinator:
                 ),
                 "NO_EVENT_IN_EXPORT",
             )
-        minutes_until = max(int((next_event.event_time_utc - now).total_seconds() // 60), 0)
+        signed_minutes = int((next_event.event_time_utc - now).total_seconds() // 60)
+        minutes_until = max(signed_minutes, 0)
         if next_event.impact == "High" and minutes_until <= 120:
             calendar_state = "HIGH_IMPACT_WINDOW"
             horizon = "High-impact event is within two hours"
@@ -986,9 +1185,11 @@ class ResearchCoordinator:
         else:
             calendar_state = "UPCOMING_USD_EVENT"
             horizon = "Upcoming event is outside the elevated-risk window"
+        if signed_minutes < 0:
+            horizon = f"{next_event.impact}-impact scheduled release is in its post-event cooling window"
         event_values = [
             f"Risk horizon: {horizon}",
-            f"Due in approximately {minutes_until} minutes ({next_event.event_time_manila.strftime('%b %d %I:%M %p PHT')})",
+            f"{'Occurred approximately' if signed_minutes < 0 else 'Due in approximately'} {abs(signed_minutes)} minutes{' ago' if signed_minutes < 0 else ''} ({next_event.event_time_manila.strftime('%b %d %I:%M %p PHT')})",
             "Public-calendar values are informational; official schedules are retained separately.",
             *macro_facts,
         ]
@@ -998,7 +1199,7 @@ class ResearchCoordinator:
             ResearchBotReport(
                 bot_id="calendar", label="Macro & event watcher", source=calendar.source, source_url=calendar.source_url,
                 data_status=calendar.data_status, state="WATCHING", source_timestamp_utc=calendar.source_timestamp_utc, updated_at_utc=now,
-                summary=f"Next USD event: {next_event.title} ({next_event.impact} impact); {horizon.lower()}.",
+                summary=f"{'Recent' if signed_minutes < 0 else 'Next risk-relevant'} USD event: {next_event.title} ({next_event.impact} impact); {horizon.lower()}.",
                 skills=["Calendar freshness", "Event impact", "PHT event schedule"],
                 facts=event_values,
                 reason_codes=calendar.reason_codes, evidence_count=0,

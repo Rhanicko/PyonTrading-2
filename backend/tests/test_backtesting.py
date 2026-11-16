@@ -29,19 +29,23 @@ def test_backtest_uses_next_bar_after_a_signal_and_records_cost_limitations():
 
     assert len(results) == 9
     assert all(trade.entry_index == trade.known_at_index + 1 for trade in trades)
-    assert all(trade.exit_index == trade.entry_index + HOLD_BARS for trade in trades)
+    assert all(trade.exit_index == trade.entry_index + HOLD_BARS - 1 for trade in trades)
     assert "COMMISSION_UNAVAILABLE" in reasons
     assert all("NO_ORDER_EXECUTION" in result.reason_codes for result in results)
     futures_only = next(result for result in results if result.strategy_id == "ORDER_FLOW_FUTURES_CONFIRMATION")
     profile_proxy = next(result for result in results if result.strategy_id == "VOLUME_PROFILE_PROXY_AUCTION")
+    m5_pullback = next(result for result in results if result.strategy_id == "M5_TREND_PULLBACK")
     assert futures_only.completed_trials == 0
     assert "LICENSED_FUTURES_DATA_REQUIRED" in futures_only.reason_codes
     assert profile_proxy.completed_trials == 0
     assert "PROXY_NOT_TRADE_AT_PRICE" in profile_proxy.reason_codes
+    assert m5_pullback.strategy_version == "m5-trend-pullback-v1"
+    assert "M5_PRICE_INDICATORS_ONLY" in m5_pullback.reason_codes
+    assert "SPREAD_ADJUSTED_NOT_NET_PNL" in m5_pullback.reason_codes
 
 
 def test_backtest_never_observes_a_forming_candle_or_generates_a_trade_without_history():
-    values = trending_candles(LOOKBACK_BARS + HOLD_BARS)
+    values = trending_candles(LOOKBACK_BARS + HOLD_BARS - 1)
     forming = candle(len(values), 9999, completed=False)
 
     assert evaluate_historical_signals([*values, forming]) == evaluate_historical_signals(values)
@@ -65,3 +69,17 @@ def test_missing_spread_does_not_create_a_net_result():
 
     assert all(result.net_points is None for result in results)
     assert all("COSTS_INCOMPLETE" in result.reason_codes for result in results)
+
+
+def test_backtest_excludes_trials_that_cross_missing_candle_intervals():
+    values = [
+        bar.model_copy(update={"open_time_utc": bar.open_time_utc + timedelta(hours=2)})
+        if index >= 100 else bar
+        for index, bar in enumerate(trending_candles())
+    ]
+
+    results, trades, reasons = run_backtest(values, point=0.01)
+
+    assert any(result.completed_trials for result in results)
+    assert all(not (trade.known_at_index < 100 <= trade.exit_index) for trade in trades)
+    assert "DISCONTINUOUS_TRIALS_EXCLUDED" in reasons

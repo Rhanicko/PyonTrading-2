@@ -134,11 +134,18 @@ def atr(candles: list[Candle], period: int = 14) -> float | None:
 def macd(values: list[float], fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> tuple[float | None, float | None, float | None]:
     if min(fast_period, slow_period, signal_period) <= 0 or fast_period >= slow_period or len(values) < slow_period + signal_period - 1:
         return None, None, None
-    lines = [
-        fast - slow
-        for index in range(slow_period - 1, len(values))
-        if (fast := ema(values[:index + 1], fast_period)) is not None and (slow := ema(values[:index + 1], slow_period)) is not None
-    ]
+    # Use the same SMA seed and recurrence as ema(), advancing once per bar.
+    # Re-evaluating every prefix here made each research window quadratic.
+    fast = sum(values[:fast_period]) / fast_period
+    slow = sum(values[:slow_period]) / slow_period
+    fast_weight, slow_weight = 2 / (fast_period + 1), 2 / (slow_period + 1)
+    for value in values[fast_period:slow_period]:
+        fast = (value - fast) * fast_weight + fast
+    lines = [fast - slow]
+    for value in values[slow_period:]:
+        fast = (value - fast) * fast_weight + fast
+        slow = (value - slow) * slow_weight + slow
+        lines.append(fast - slow)
     signal = ema(lines, signal_period)
     if not lines or signal is None:
         return None, None, None

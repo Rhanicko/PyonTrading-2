@@ -1,75 +1,43 @@
 import { CandlestickSeries, ColorType, createChart, HistogramSeries, LineSeries, type IChartApi, type IPaneApi, type ISeriesApi, type Time, type UTCTimestamp } from "lightweight-charts";
 import { useEffect, useMemo, useRef } from "react";
-import { bollingerSeries, emaSeries, indicatorReadings, tickActivitySeries, tickActivityVwap } from "../services/chartIndicators";
-import { defaultViewportRange } from "../services/chartViewport";
+import { bollingerSeries, emaSeries, indicatorReadings, tickActivitySeries, tickActivityVwapSessions } from "../services/chartIndicators";
+import { chartViewportStorageKey, defaultViewportRange, loadViewport, visiblePriceRange, type ChartViewportIdentity } from "../services/chartViewport";
 import type { Candle } from "../types/api";
 
 export type ChartOverlayKey = "trend" | "vwap" | "bands" | "activity";
 export type ChartOverlays = Record<ChartOverlayKey, boolean>;
 
-interface Props { candles: Candle[]; timeframe: string; overlays: ChartOverlays; }
+interface Props { candles: Candle[]; timeframe: string; overlays: ChartOverlays; brokerServer: string | null; symbol: string | null; }
 
 type CandleSeries = ISeriesApi<"Candlestick", Time>;
 type LineChartSeries = ISeriesApi<"Line", Time>;
 type HistogramChartSeries = ISeriesApi<"Histogram", Time>;
-type ViewportRange = { from: number; to: number };
-
-function viewportKey(timeframe: string) {
-  return `pyontrading.chart.viewport.v2.xauusd.${timeframe}`;
-}
-
-function savedViewport(timeframe: string): ViewportRange | null {
-  try {
-    const value = JSON.parse(window.localStorage.getItem(viewportKey(timeframe)) ?? "null") as ViewportRange | null;
-    return value && Number.isFinite(value.from) && Number.isFinite(value.to) && value.to > value.from ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveViewport(timeframe: string, range: ViewportRange) {
-  try {
-    window.localStorage.setItem(viewportKey(timeframe), JSON.stringify(range));
-  } catch {
-    // A private browser mode may reject storage. The chart still works for this session.
-  }
-}
-
 function chartData(candles: Candle[]) {
   return candles.map((item) => ({ time: Math.floor(new Date(item.open_time_utc).getTime() / 1000) as UTCTimestamp, open: item.open, high: item.high, low: item.low, close: item.close }));
-}
-
-function centeredPriceRange(candles: Candle[]) {
-  const latestClose = candles.at(-1)?.close;
-  if (latestClose === undefined || !candles.length) return null;
-  const high = Math.max(...candles.map((item) => item.high));
-  const low = Math.min(...candles.map((item) => item.low));
-  const halfRange = Math.max(
-    Math.abs(high - latestClose),
-    Math.abs(latestClose - low),
-    (high - low) * 0.2,
-    Math.abs(latestClose) * 0.001,
-  ) * 1.12;
-  return { from: latestClose - halfRange, to: latestClose + halfRange };
 }
 
 function format(value: number | null, digits = 2): string {
   return value === null ? "—" : value.toFixed(digits);
 }
 
-export function PriceChart({ candles, timeframe, overlays }: Props) {
+export function PriceChart({ candles, timeframe, overlays, brokerServer, symbol }: Props) {
   const root = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
   const candleSeries = useRef<CandleSeries | null>(null);
   const ema20Series = useRef<LineChartSeries | null>(null);
   const ema60Series = useRef<LineChartSeries | null>(null);
-  const vwapSeries = useRef<LineChartSeries | null>(null);
+  const vwapSeries = useRef<LineChartSeries[]>([]);
+  const vwapVisible = useRef(overlays.vwap);
+  vwapVisible.current = overlays.vwap;
   const upperBandSeries = useRef<LineChartSeries | null>(null);
   const lowerBandSeries = useRef<LineChartSeries | null>(null);
   const activitySeries = useRef<HistogramChartSeries | null>(null);
   const activityPane = useRef<IPaneApi<Time> | null>(null);
-  const fittedTimeframe = useRef<string | null>(null);
-  const centeredPriceTimeframe = useRef<string | null>(null);
+  const fittedViewport = useRef<string | null>(null);
+  const viewportIdentity = useMemo<ChartViewportIdentity>(() => ({ brokerServer, symbol, timeframe }), [brokerServer, symbol, timeframe]);
+  const viewportIdentityRef = useRef(viewportIdentity);
+  viewportIdentityRef.current = viewportIdentity;
+  const viewportStorageKey = chartViewportStorageKey(viewportIdentity);
   const readings = useMemo(() => indicatorReadings(candles), [candles]);
 
   useEffect(() => {
@@ -87,7 +55,6 @@ export function PriceChart({ candles, timeframe, overlays }: Props) {
     candleSeries.current = instance.addSeries(CandlestickSeries, { upColor: "#5ee3ae", downColor: "#ff8278", borderVisible: false, wickUpColor: "#5ee3ae", wickDownColor: "#ff8278" });
     ema20Series.current = instance.addSeries(LineSeries, { color: "#66c7e8", lineWidth: 1, title: "EMA 20", lastValueVisible: false, priceLineVisible: false });
     ema60Series.current = instance.addSeries(LineSeries, { color: "#b99ce3", lineWidth: 1, title: "EMA 60", lastValueVisible: false, priceLineVisible: false });
-    vwapSeries.current = instance.addSeries(LineSeries, { color: "#e1b64d", lineWidth: 1, lineStyle: 2, title: "Session VWAP - MT5 tick-activity proxy", lastValueVisible: false, priceLineVisible: false });
     upperBandSeries.current = instance.addSeries(LineSeries, { color: "rgba(154, 174, 188, .58)", lineWidth: 1, lineStyle: 2, title: "Bollinger upper", lastValueVisible: false, priceLineVisible: false });
     lowerBandSeries.current = instance.addSeries(LineSeries, { color: "rgba(154, 174, 188, .58)", lineWidth: 1, lineStyle: 2, title: "Bollinger lower", lastValueVisible: false, priceLineVisible: false });
     const pane = instance.addPane();
@@ -100,9 +67,13 @@ export function PriceChart({ candles, timeframe, overlays }: Props) {
       height: element.clientHeight || 512,
     }));
     const timeScale = instance.timeScale();
-    const persistViewport = (range: ViewportRange | null) => {
-      if (!range || !fittedTimeframe.current) return;
-      saveViewport(fittedTimeframe.current, range);
+    const persistViewport = (range: { from: number; to: number } | null) => {
+      if (!range || !fittedViewport.current) return;
+      try {
+        window.localStorage.setItem(chartViewportStorageKey(viewportIdentityRef.current), JSON.stringify(range));
+      } catch {
+        // A private browser mode may reject storage. The chart still works for this session.
+      }
     };
     timeScale.subscribeVisibleLogicalRangeChange(persistViewport);
     observer.observe(element);
@@ -115,7 +86,7 @@ export function PriceChart({ candles, timeframe, overlays }: Props) {
       candleSeries.current = null;
       ema20Series.current = null;
       ema60Series.current = null;
-      vwapSeries.current = null;
+      vwapSeries.current = [];
       upperBandSeries.current = null;
       lowerBandSeries.current = null;
       activitySeries.current = null;
@@ -130,34 +101,51 @@ export function PriceChart({ candles, timeframe, overlays }: Props) {
     candleSeries.current?.setData(chartData(candles));
     ema20Series.current?.setData(emaSeries(candles, 20));
     ema60Series.current?.setData(emaSeries(candles, 60));
-    vwapSeries.current?.setData(tickActivityVwap(candles));
+    const sessionData = tickActivityVwapSessions(candles);
+    const instance = chart.current;
+    if (instance) {
+      while (vwapSeries.current.length > sessionData.length) {
+        instance.removeSeries(vwapSeries.current.pop()!);
+      }
+      while (vwapSeries.current.length < sessionData.length) {
+        vwapSeries.current.push(instance.addSeries(LineSeries, { color: "#e1b64d", lineWidth: 1, lineStyle: 2, title: "", lastValueVisible: false, priceLineVisible: false, visible: vwapVisible.current }));
+      }
+      sessionData.forEach((points, index) => {
+        const series = vwapSeries.current[index];
+        series.setData(points);
+        series.applyOptions({ title: index === sessionData.length - 1 ? "Session VWAP - MT5 tick-activity proxy" : "" });
+      });
+    }
     upperBandSeries.current?.setData(bands.upper);
     lowerBandSeries.current?.setData(bands.lower);
     activitySeries.current?.setData(tickActivitySeries(candles));
-    if (centeredPriceTimeframe.current !== timeframe) {
-      const range = centeredPriceRange(candles);
+    if (timeScale && fittedViewport.current !== viewportStorageKey) {
+      let storedViewport = null;
+      try {
+        storedViewport = loadViewport(window.localStorage, viewportIdentity);
+      } catch {
+        // The chart uses its deterministic default when browser storage is unavailable.
+      }
+      const viewport = storedViewport ?? defaultViewportRange(candles.length);
+      timeScale.setVisibleLogicalRange(viewport);
+      const range = visiblePriceRange(candles, viewport);
       if (range) {
         const priceScale = chart.current?.priceScale("right");
         priceScale?.setAutoScale(false);
         priceScale?.setVisibleRange(range);
       }
-      centeredPriceTimeframe.current = timeframe;
-    }
-    if (timeScale && fittedTimeframe.current !== timeframe) {
-      const storedViewport = savedViewport(timeframe);
-      timeScale.setVisibleLogicalRange(storedViewport ?? defaultViewportRange(candles.length));
-      fittedTimeframe.current = timeframe;
+      fittedViewport.current = viewportStorageKey;
     } else if (timeScale && visibleRange) {
       // Retain the trader's zoom and manual pan through websocket/API updates.
       // The view never follows a new bar automatically.
       timeScale.setVisibleLogicalRange(visibleRange);
     }
-  }, [candles, timeframe]);
+  }, [candles, viewportIdentity, viewportStorageKey]);
 
   useEffect(() => {
     ema20Series.current?.applyOptions({ visible: overlays.trend });
     ema60Series.current?.applyOptions({ visible: overlays.trend });
-    vwapSeries.current?.applyOptions({ visible: overlays.vwap });
+    vwapSeries.current.forEach((series) => series.applyOptions({ visible: overlays.vwap }));
     upperBandSeries.current?.applyOptions({ visible: overlays.bands });
     lowerBandSeries.current?.applyOptions({ visible: overlays.bands });
     activitySeries.current?.applyOptions({ visible: overlays.activity });
@@ -169,13 +157,13 @@ export function PriceChart({ candles, timeframe, overlays }: Props) {
     const timeScale = chart.current?.timeScale();
     if (!timeScale) return;
     try {
-      window.localStorage.removeItem(viewportKey(timeframe));
+      window.localStorage.removeItem(viewportStorageKey);
     } catch {
       // Resetting the in-memory view remains available when storage is unavailable.
     }
     timeScale.resetTimeScale();
     timeScale.setVisibleLogicalRange(defaultViewportRange(candles.length));
-    const range = centeredPriceRange(candles);
+    const range = visiblePriceRange(candles, defaultViewportRange(candles.length));
     if (range) {
       const priceScale = chart.current?.priceScale("right");
       priceScale?.setAutoScale(false);

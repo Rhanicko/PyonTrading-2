@@ -1,0 +1,26 @@
+.market-scanner { padding: 18px; margin-top: 14px; min-width: 0; }
+.market-scanner > header { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.market-scanner h2 { margin: 5px 0; font-size: 21px; }
+.market-scanner p, .top-down-panel p { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.market-scanner button { min-height: 38px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-raised); color: var(--ink); cursor: pointer; }
+.market-scanner button:focus-visible, .market-scanner summary:focus-visible, .top-down-panel summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.market-scanner button:disabled { opacity: .65; cursor: wait; }
+.market-scanner details, .top-down-panel { border-top: 1px solid var(--line); padding: 12px 0; }
+.market-scanner summary, .top-down-panel summary { cursor: pointer; color: var(--ink); font-size: 13px; }
+.market-scanner li { color: var(--muted); font-size: 13px; line-height: 1.8; }
+.currency-strength-list { display: flex; gap: 10px; flex-wrap: wrap; padding: 8px 0; }
+.currency-strength-list > span { padding: 8px; border: 1px solid var(--line); border-radius: 6px; }
+.top-down-panel summary strong { float: right; color: var(--accent); }
+.top-down-panel ol { margin: 10px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.top-down-panel li { padding: 10px; border: 1px solid var(--line); border-radius: 7px; min-width: 0; }
+.top-down-panel li > div { display: flex; gap: 6px 12px; flex-wrap: wrap; align-items: center; }
+.top-down-panel li strong { font-size: 13px; }
+.top-down-panel li span, .top-down-panel li small { color: var(--muted); font-size: 11px; }
+.top-down-panel li small { display: inline-block; margin: 5px 7px 0 0; }
+.top-down-panel li b { margin-left: auto; color: var(--warning); font-size: 11px; text-transform: uppercase; }
+.top-down-panel li b.confirmed { color: var(--live); }
+.top-down-panel li b.rejected { color: var(--danger); }
+.top-down-panel li p { margin: 6px 0 0; font-size: 11px; overflow-wrap: anywhere; }
+.validation-details { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+.validation-details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+@media (max-width: 600px) { .market-scanner { padding: 12px; } .market-scanner > header { align-items: flex-start; } .market-scanner button { flex: none; font-size: 12px; } }
