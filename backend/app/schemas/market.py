@@ -42,6 +42,39 @@ class ConnectionResponse(ApiEnvelope):
     gold_symbols: list[SymbolSummary] = Field(default_factory=list)
 
 
+class HfmDemoStatus(ApiEnvelope):
+    """A credential-free view of the locally logged-in demo account."""
+
+    source: str = "MT5_HFM_DEMO"
+    ready: bool = False
+    account_mode: Literal["DEMO", "LIVE", "UNKNOWN"] = "UNKNOWN"
+    broker_server: str | None = None
+    configured_symbol: str | None = None
+
+
+class HfmAccountStatus(ApiEnvelope):
+    """Credential-free status of the active local HFM MT5 session."""
+
+    source: str = "MT5_HFM_ACCOUNT"
+    connected: bool = False
+    account_mode: Literal["DEMO", "LIVE", "UNKNOWN"] = "UNKNOWN"
+    broker_server: str | None = None
+    account_id_suffix: str | None = None
+    configured_symbol: str | None = None
+
+
+class HfmAccountFinancials(ApiEnvelope):
+    """USD account values from one verified local MT5 account observation."""
+
+    source: str = "MT5_HFM_ACCOUNT"
+    account_mode: Literal["DEMO", "LIVE", "UNKNOWN"] = "UNKNOWN"
+    broker_server: str | None = None
+    account_id_suffix: str | None = None
+    currency: str | None = None
+    balance: float | None = None
+    equity: float | None = None
+
+
 class SymbolsResponse(ApiEnvelope):
     """Exact instruments discovered from the connected local terminal."""
 
@@ -70,6 +103,48 @@ class QuoteResponse(ApiEnvelope):
     raw_source_timestamp_utc: datetime | None = None
     broker_clock_offset_seconds: int = 0
     timestamp_normalized: bool = False
+
+
+class ScannedInstrument(BaseModel):
+    symbol: str
+    base_currency: str
+    quote_currency: str
+    data_status: DataStatus
+    source_timestamp_utc: datetime | None = None
+    candle_close_utc: datetime | None = None
+    return_20_bars_percent: float | None = None
+    atr_percent: float | None = None
+    spread_atr_ratio: float | None = None
+    comparison_rank: int | None = None
+    structure: str = "UNAVAILABLE"
+    market_regime: str = "UNAVAILABLE"
+    signal_authority: Literal[False] = False
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+class CurrencyStrength(BaseModel):
+    currency: str
+    return_score_percent: float
+    pair_count: int
+
+
+class MarketCorrelation(BaseModel):
+    first_symbol: str
+    second_symbol: str
+    return_correlation: float
+    shared_return_bars: int
+    shared_currencies: list[str]
+    overlapping_exposure: bool
+
+
+class MarketScanResponse(ApiEnvelope):
+    source: str = "MT5_VISIBLE_INSTRUMENT_CONTEXT"
+    broker_server: str | None = None
+    timeframe: Literal["H1"] = "H1"
+    instruments: list[ScannedInstrument] = Field(default_factory=list)
+    currency_strength: list[CurrencyStrength] = Field(default_factory=list)
+    correlations: list[MarketCorrelation] = Field(default_factory=list)
+    ranking_basis: str = "ABS_20_H1_RETURN_OVER_ATR_PERCENT_CONTEXT_ONLY"
 
 
 class Candle(BaseModel):
@@ -270,6 +345,7 @@ class CalendarEvent(BaseModel):
 
 
 class EventsResponse(ApiEnvelope):
+    risk_events: list[CalendarEvent] = Field(default_factory=list)
     source: str = "FOREX_FACTORY_PUBLIC_WEEKLY_EXPORT"
     source_url: str
     events: list[CalendarEvent] = Field(default_factory=list)
@@ -315,8 +391,25 @@ class StrategySettingPayload(BaseModel):
     enabled: bool
 
 
+class SignalForwardOutcome(BaseModel):
+    """Observed directional close movement, not an executed trade outcome."""
+
+    signal_id: str
+    label_version: str
+    broker_server: str
+    horizon_bars: Literal[12]
+    anchor_close_utc: datetime
+    outcome_close_utc: datetime
+    anchor_close: float
+    outcome_close: float
+    directional_change: float
+    directional_state: Literal["FAVORABLE", "ADVERSE", "FLAT"]
+    source: Literal["MT5_COMPLETED_M5_CANDLES"]
+    labelled_at_utc: datetime
+
+
 class SignalHistoryEntry(BaseModel):
-    """An immutable on-demand research result shown to the local user."""
+    """An immutable automatic signal or on-demand research result."""
 
     signal_id: str
     provided_at_utc: datetime
@@ -332,6 +425,13 @@ class SignalHistoryEntry(BaseModel):
     paper_status: str | None = None
     input_fingerprint: str
     reason_codes: list[str] = Field(default_factory=list)
+    signal_kind: Literal["AUTOMATIC", "ON_DEMAND"] = "ON_DEMAND"
+    broker_server: str | None = None
+    feature_set_version: str | None = None
+    reference_levels: ResearchReferenceLevels | None = None
+    signal_proof: ResearchSignalProof | None = None
+    expires_at_utc: datetime | None = None
+    forward_outcome: SignalForwardOutcome | None = None
 
 
 class SignalHistoryResponse(ApiEnvelope):
@@ -451,6 +551,23 @@ class PaperTradingReport(BaseModel):
     reason_codes: list[str] = Field(default_factory=list)
 
 
+class SignalProofFailure(BaseModel):
+    code: str
+    runs: int = Field(ge=1)
+
+
+class SignalProofAudit(BaseModel):
+    source: Literal["LOCAL_FROZEN_RESEARCH_RUNS"]
+    sample_limit: int = Field(ge=1)
+    sampled_runs: int = Field(ge=0)
+    proof_evaluated_runs: int = Field(ge=0)
+    eligible_runs: int = Field(ge=0)
+    published_signals: int = Field(ge=0)
+    latest_proof_anchor_utc: datetime | None = None
+    failed_checks: list[SignalProofFailure] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+
+
 class ValidationSummary(BaseModel):
     symbol: str | None = None
     total_frozen_decisions: int = Field(ge=0)
@@ -463,11 +580,13 @@ class ValidationSummary(BaseModel):
     regime_counts: dict[str, int] = Field(default_factory=dict)
     maximum_drawdown_points: float | None = None
     cost_status: Literal["SPREAD_ONLY", "COSTS_INCOMPLETE"] = "COSTS_INCOMPLETE"
+    proof_audit: SignalProofAudit
     reason_codes: list[str] = Field(default_factory=list)
 
 
 class OperationsStatus(BaseModel):
     kill_switch_enabled: bool = False
+    research_pipeline_enabled: bool = True
     model_promotion_state: Literal["REVIEW_REQUIRED", "NOT_APPROVED"] = "REVIEW_REQUIRED"
     daily_research_failure_count: int = Field(default=0, ge=0)
     alerts: list[str] = Field(default_factory=list)
@@ -476,6 +595,10 @@ class OperationsStatus(BaseModel):
 
 
 class KillSwitchPayload(BaseModel):
+    enabled: bool
+
+
+class PipelineControlPayload(BaseModel):
     enabled: bool
 
 
@@ -500,7 +623,7 @@ class TechnicalIndicators(BaseModel):
 class TimeframeEvidence(BaseModel):
     """Broker-candle evidence used by the multi-timeframe research screen."""
 
-    timeframe: Literal["M5", "M15", "H1", "H4"]
+    timeframe: Literal["M1", "M5", "M15", "H1", "H4", "D1"]
     window_label: str
     required_completed_candles: int = Field(ge=1)
     completed_candles: int = Field(ge=0)
@@ -509,6 +632,29 @@ class TimeframeEvidence(BaseModel):
     structure: Literal["UPWARD_STRUCTURE", "DOWNWARD_STRUCTURE", "MIXED_STRUCTURE", "UNAVAILABLE"] = "UNAVAILABLE"
     indicators: TechnicalIndicators | None = None
     reason_codes: list[str] = Field(default_factory=list)
+    setup_kind: str | None = None
+    setup_known_at_utc: datetime | None = None
+    invalidation_price: float | None = None
+
+
+class ConfirmationStage(BaseModel):
+    stage: Literal["BIAS", "INTRADAY", "SETUP", "TRIGGER", "TIMING", "RISK"]
+    state: Literal["CONFIRMED", "REJECTED", "UNAVAILABLE", "PENDING"]
+    timeframes: list[str] = Field(default_factory=list)
+    required: bool = True
+    evidence_timestamps: dict[str, datetime] = Field(default_factory=dict)
+    invalidation_price: float | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+class TopDownValidation(BaseModel):
+    version: Literal["top-down-v1"] = "top-down-v1"
+    state: Literal["CONFIRMED", "REJECTED", "UNAVAILABLE", "PENDING"]
+    direction: Literal["LONG_CONTEXT", "SHORT_CONTEXT", "NONE"]
+    observed_at_utc: datetime
+    stages: list[ConfirmationStage] = Field(default_factory=list)
+    timeframes: list[TimeframeEvidence] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=lambda: ["UNVALIDATED_RULES", "NO_ORDER_EXECUTION"])
 
 
 class ResearchResponse(ApiEnvelope):
@@ -533,6 +679,35 @@ class ResearchResponse(ApiEnvelope):
     # Derived from this exact source snapshot so the workstation does not run
     # a second concurrent MT5 research pass merely to render the live watch.
     live_research_watch: LiveResearchWatchResponse | None = None
+    top_down: TopDownValidation | None = None
+
+
+class ResearchReferenceLevels(BaseModel):
+    """Unvalidated 1R/2R research reference, never an executable trade ticket."""
+
+    entry: float
+    stop_loss: float
+    take_profit_1: float
+    take_profit_2: float
+    source_candle_close_utc: datetime
+    quote_observed_at_utc: datetime
+    basis: Literal["M5_ATR14_1R_2R_UNVALIDATED"] = "M5_ATR14_1R_2R_UNVALIDATED"
+
+
+class ResearchSignalProofCheck(BaseModel):
+    code: str
+    passed: bool
+    detail: str
+
+
+class ResearchSignalProof(BaseModel):
+    """Decision-time source checks, not a calibrated success probability."""
+
+    publication_state: Literal["ELIGIBLE", "WITHHELD"] = "WITHHELD"
+    performance_state: Literal["UNVALIDATED"] = "UNVALIDATED"
+    checks: list[ResearchSignalProofCheck] = Field(default_factory=list)
+    rule_versions: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
 
 
 class LiveResearchWatchResponse(ApiEnvelope):
@@ -559,6 +734,9 @@ class LiveResearchWatchResponse(ApiEnvelope):
     horizon_reason_codes: list[str] = Field(default_factory=list)
     evidence_score: int = Field(default=0, ge=0, le=100)
     evidence_score_basis: str = "EVIDENCE_COVERAGE_NOT_PROBABILITY"
+    reference_levels: ResearchReferenceLevels | None = None
+    reference_levels_reason: str = "NO_ACTIVE_DIRECTIONAL_RESEARCH_WATCH"
+    signal_proof: ResearchSignalProof | None = None
     active_from_utc: datetime | None = None
     scheduled_review_at_utc: datetime | None = None
     expires_at_utc: datetime | None = None
@@ -570,11 +748,14 @@ class LiveResearchWatchResponse(ApiEnvelope):
     event_risk_state: str = "UNVERIFIED"
     strategy_ensemble: StrategyEnsemble | None = None
 
+    top_down: TopDownValidation | None = None
+
 
 class MarketAnalysisResponse(ApiEnvelope):
+    top_down: TopDownValidation | None = None
     source: str = "PYONTRADING2_RESEARCH_SCREEN"
     symbol: str | None = None
-    analysis_mode: Literal["RESEARCH_SCREEN_V4_PROFESSIONAL_MODULES"] = "RESEARCH_SCREEN_V4_PROFESSIONAL_MODULES"
+    analysis_mode: Literal["RESEARCH_SCREEN_V5_SHARED_TOP_DOWN"] = "RESEARCH_SCREEN_V5_SHARED_TOP_DOWN"
     decision: Literal["NO_TRADE", "WATCH_LONG", "WATCH_SHORT"] = "NO_TRADE"
     market_context: Literal["UPWARD_STRUCTURE", "DOWNWARD_STRUCTURE", "MIXED_STRUCTURE", "UNAVAILABLE"] = "UNAVAILABLE"
     summary: str
@@ -592,14 +773,14 @@ class MarketAnalysisResponse(ApiEnvelope):
 
 
 class BacktestStrategyResult(BaseModel):
-    strategy_id: Literal["PRICE_STRUCTURE_BASELINE", "ICT_LIQUIDITY_REVERSAL", "MOMENTUM_CONTINUATION", "HTF_TREND_PULLBACK", "LIQUIDITY_SWEEP_PROXY", "VWAP_TICK_PROXY_MOMENTUM", "OPENING_RANGE_BREAKOUT", "VOLUME_PROFILE_PROXY_AUCTION", "ORDER_FLOW_FUTURES_CONFIRMATION"]
+    strategy_id: Literal["PRICE_STRUCTURE_BASELINE", "ICT_LIQUIDITY_REVERSAL", "MOMENTUM_CONTINUATION", "M5_TREND_PULLBACK", "LIQUIDITY_SWEEP_PROXY", "VWAP_TICK_PROXY_MOMENTUM", "OPENING_RANGE_BREAKOUT", "VOLUME_PROFILE_PROXY_AUCTION", "ORDER_FLOW_FUTURES_CONFIRMATION"]
     strategy_version: str
     observed_signals: int = Field(ge=0)
     completed_trials: int = Field(ge=0)
     gross_wins: int = Field(ge=0)
     gross_losses: int = Field(ge=0)
     gross_points: float
-    net_points: float | None = None
+    net_points: float | None = Field(default=None, description="Spread-adjusted points only; commission, slippage, swap, and actual-fill quality are unavailable.")
     reason_codes: list[str] = Field(default_factory=list)
 
 
@@ -614,6 +795,51 @@ class BacktestResponse(ApiEnvelope):
     results: list[BacktestStrategyResult] = Field(default_factory=list)
     cost_model: str
     limitation: str
+
+
+class WalkForwardMetrics(BaseModel):
+    trials: int = Field(ge=0)
+    wins: int = Field(ge=0)
+    losses: int = Field(ge=0)
+    gross_points: float
+    net_points: float | None = Field(default=None, description="Recorded-spread-adjusted points, not net P&L.")
+    spread_adjusted_expectancy_points: float | None = None
+    spread_adjusted_profit_factor: float | None = None
+    spread_adjusted_max_drawdown_points: float | None = None
+    spread_adjusted_win_rate_percent: float | None = None
+
+
+class RollingValidationFold(BaseModel):
+    training_candles: int
+    validation_start_utc: datetime
+    validation_end_utc: datetime
+    selected_hold_bars: int | None
+    validation: WalkForwardMetrics
+
+
+class WalkForwardStrategyResult(BaseModel):
+    strategy_id: str
+    strategy_version: str
+    selected_hold_bars: int | None = None
+    training: WalkForwardMetrics
+    validation: WalkForwardMetrics
+    held_out: WalkForwardMetrics
+    state: Literal["REVIEW_REQUIRED", "INSUFFICIENT_DATA"]
+    reason_codes: list[str] = Field(default_factory=list)
+    walk_forward: list[RollingValidationFold] = Field(default_factory=list)
+
+
+class WalkForwardResponse(ApiEnvelope):
+    source: str = "PYONTRADING2_FULL_ARCHIVE_WALK_FORWARD"
+    symbol: str | None = None
+    broker_server: str | None = None
+    timeframe: Literal["M5"] = "M5"
+    dataset_start_utc: datetime | None = None
+    dataset_end_utc: datetime | None = None
+    completed_candles: int = Field(ge=0)
+    cache_hit: bool = False
+    results: list[WalkForwardStrategyResult] = Field(default_factory=list)
+    limitation: str = "Standalone M5 strategy calibration only; recorded spread is not complete cost or live-signal profitability. No model promotion or order execution."
 
 
 class BacktestRunSummary(BaseModel):

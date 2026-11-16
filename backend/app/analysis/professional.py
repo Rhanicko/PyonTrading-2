@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime, time, timedelta
 from statistics import median
+from math import isfinite
 from zoneinfo import ZoneInfo
 
 from app.analysis.technical import TechnicalSnapshot, analyze_completed_candles, completed_candles
@@ -264,9 +265,18 @@ def risk_engine(
     This function deliberately returns only research eligibility. It has no
     sizing, entry, stop, target, or broker-order capability.
     """
-    quote_current = quote.data_status == DataStatus.LIVE and quote.tick_age_seconds is not None
-    contract = all(value is not None and value > 0 for value in (quote.point, quote.tick_size, quote.tick_value, quote.volume_min, quote.volume_step, quote.contract_size))
-    spread = quote.spread_points is not None and quote.spread_points >= 0
+    quote_current = bool(
+        quote.data_status == DataStatus.LIVE and quote.tick_age_seconds is not None
+        and isfinite(quote.tick_age_seconds) and 0 <= quote.tick_age_seconds <= 5
+        and quote.source_timestamp_utc is not None
+        and -2 <= (quote.observed_at_utc - quote.source_timestamp_utc).total_seconds() <= 5
+    )
+    contract = all(value is not None and isfinite(value) and value > 0 for value in (quote.point, quote.tick_size, quote.tick_value, quote.volume_min, quote.volume_step, quote.contract_size))
+    spread = bool(
+        quote.spread_points is not None and isfinite(quote.spread_points) and quote.spread_points >= 0
+        and quote.bid is not None and quote.ask is not None
+        and isfinite(quote.bid) and isfinite(quote.ask) and quote.ask >= quote.bid > 0
+    )
     event_clear = calendar_state not in {"HIGH_IMPACT_WINDOW", "ELEVATED_EVENT_WINDOW", "UNVERIFIED"}
     directions = {report.direction for report in module_reports if report.direction != "ABSTAIN" and report.state in {"ARMED", "TRIGGERED"}}
     reasons: list[str] = ["NO_ORDER_EXECUTION", "COMMISSION_UNAVAILABLE", "SLIPPAGE_UNAVAILABLE", "STRUCTURAL_STOP_NOT_PUBLISHED"]

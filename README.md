@@ -11,8 +11,10 @@ PyonTrading 2 is a local, read-only XAUUSD market-data workstation for a **local
 - Creates a local SQLite database in WAL mode for non-sensitive settings plus immutable, completed broker-candle and research evidence records.
 - Includes completed-candle technical context: confirmed swings, completed-close BOS/CHOCH events, three-candle fair value gaps, EMA, RSI and ATR. Each pattern retains confirmation timing so it cannot appear before it could have been known.
 - Runs a background research pipeline independently of the browser. It archives completed M5/M15/H1/H4 bars, queues a cross-bot review on a new completed M5 bar, persists the exact public-calendar response used, and creates outcome labels only after later completed M5 bars exist.
+- Provides an **Automation** screen for the background research worker. A local operator token is required to pause or resume it; the choice persists across app restarts and is audited. An in-flight cycle may finish before the pause takes effect. This control does not arm or submit broker orders.
 - Runs a bounded chronological strategy calibration only when the broker exposes at least 5,000 completed M5 bars. Every calibration remains `REVIEW_REQUIRED`; it is never automatically promoted into an execution model.
 - Runs source-labelled research bots for broker data quality, multi-timeframe structure, momentum, public/official macro schedules, optional cross-market context, and a versioned deterministic-rule ensemble. Each bot can abstain independently.
+- Shows indicative entry, stop, TP1 and TP2 reference levels on the main desk only for an active directional watch with a fresh nearby MT5 quote and completed M5 ATR. The simple 1R/2R levels are unvalidated research, disappear when gates withhold the watch, and are never broker orders.
 - Adds professional completed-candle research for liquidity sweeps/reclaims, IANA-session opening ranges, VWAP/relative tick activity, estimated delta and a close-bucket profile proxy. Each result identifies whether it is broker tick activity, an estimate, genuine futures data, or unavailable.
 - Persists append-only professional strategy-module observations with their source labels and risk-review disposition after a completed M5 pipeline run.
 - Checks tick freshness, completed-candle gaps, spread anomalies, retained broker-clock normalization, and observed broker-session state transitions before a research watch condition can pass.
@@ -23,7 +25,7 @@ PyonTrading 2 is a local, read-only XAUUSD market-data workstation for a **local
 - Withholds hypothetical paper candidates unless commission and slippage inputs are source-backed; a directional watch alone cannot become a paper result.
 - Keeps an append-only local **Signal History** of every research screen returned after **Analyze market**, including `NO_TRADE` and unavailable outcomes, their source timestamp, reason codes, and an evidence fingerprint. It is an audit trail of research provided—not a trade ledger or execution log.
 
-Not implemented yet: a licensed COMEX/futures executed-flow and consolidated-depth provider, authentic volume-at-price/footprint data, verified broker commission/slippage/swap capture, tick-level observed fill-quality measurement, complete multi-provider calendar/news verification, structural entry/stop/target candidates, position sizing, drift thresholds, human-reviewed promotion acceptance thresholds, a multi-pair screener, full event-driven bid/ask replay, and real machine-learning/Kronos model training. A local calibration or historical replay is not a performance guarantee or high-confidence signal. Real-money order execution is intentionally absent.
+Not implemented yet: a licensed COMEX/futures executed-flow and consolidated-depth provider, authentic volume-at-price/footprint data, verified broker commission/slippage/swap capture, tick-level observed fill-quality measurement, complete multi-provider calendar/news verification, validated structural entry/stop/target strategies, position sizing, drift thresholds, human-reviewed promotion acceptance thresholds, a multi-pair screener, full event-driven bid/ask replay, and real machine-learning/Kronos model training. A local calibration or historical replay is not a performance guarantee or high-confidence signal. Real-money order execution is intentionally absent.
 
 ## Recent research-control additions
 
@@ -67,7 +69,25 @@ After the first setup, double-click **PyonTrading 2** on your Windows Desktop. I
 
 On first connection, add your broker's exact gold symbol to MT5 Market Watch, then select the discovered alias in the dashboard. The app will not guess `XAUUSD`, `XAUUSDm`, or `GOLD`.
 
+## HFM account connection
+
+Open **Sources & rules** and use **Open HFM account portal** to create or find an HFM demo or real trading account. A myHF website login manages accounts but does not connect the desktop MT5 terminal. Sign in to the intended **HFM MT5 trading account** in MT5 with the trading account ID, password, and exact server supplied by HFM. Keep the password in MT5, never in PyonTrading or this repository. Choose the target demo or real account type in the connection card, then switch the actual account in MT5's Navigator. The card verifies whether the active MT5 session matches your choice and shows only the last four digits of a verified HFM account ID. It checks immediately and every 10 seconds while Sources & rules is open; **Check HFM connection** also allows a manual refresh. One local terminal session can show only its currently signed-in account. Real and demo accounts can provide read-only broker data when connected; neither enables order placement in PyonTrading.
+
+For the separate, optional **demo safety binding** check, bind the exact demo identity before starting the app:
+
+For the current PowerShell launch session, bind the exact demo identity before starting the app:
+
+```powershell
+$env:PYON_HFM_DEMO_LOGIN = "your HFM demo trading account ID"
+$env:PYON_HFM_DEMO_SERVER = "the exact server shown in MT5"
+.\Start-PyonTrading2.ps1
+```
+
+The optional demo check appears only when an HFM demo account is connected. It displays the account mode and server, but not the account ID or password. Its stricter binding checks do not determine whether the account can provide read-only research data. No demo or real-money order placement exists in PyonTrading.
+
 For optional DXY, Treasury-yield, oil, or volatility context, use **Context setup** in the dashboard and enter the corresponding exact broker symbol only after it is available from that broker. The app validates the exact symbol, adds it to MT5 Market Watch when needed, persists it locally, and refreshes the read-only context service without a restart. Startup environment values remain optional defaults only. These features are explicitly contextual, never causal proof or an execution trigger. To operate the local paper kill switch, set a strong `PYON_OPERATOR_TOKEN`; the API rejects control changes when that token is not configured.
+
+To use the **Automation** screen's research pause/resume control, set a strong `PYON_OPERATOR_TOKEN` in the server's local environment and restart the app. Enter it in the screen when changing state. The browser keeps it in memory only, not local storage. The same token unlocks a read-only MT5 account balance and equity view, refreshed every five seconds only while that screen is open. Amounts appear only for a verified HFM account denominated in USD; they disappear if the source becomes unavailable, and no currency conversion or financial history is inferred. Pausing stops new background collection and research cycles; on-demand research screens remain available. Broker order automation is not implemented, even if an HFM demo account is connected.
 
 ## Development and checks
 

@@ -13,7 +13,7 @@ This is an implementation status document, not a claim of profitability.
 | 6 | Cost-aware paper outcomes and event-driven replay | Partial | Requires source-backed commission, slippage, swap and unambiguous historical fill assumptions. |
 | 7 | Training lab / champion-challenger registry | Partial | Uses chronological calibration only; requires sufficient archived data, holdout evidence and human review. |
 | 8 | Optional Kronos forecasting lab | Disabled | Requires upstream license/API review, explicit model-weight approval, CPU benchmark and shadow-only validation. |
-| 9 | Operational handoff and quality | In progress | Local tests, desktop/mobile browser checks, backups and docs must be recorded for each release. |
+| 9 | Operational handoff and quality | In progress | The remediation audit records 78 backend tests, 7 frontend unit tests, and 15 desktop/tablet/mobile browser flows; live-provider checks and staged CSS extraction remain. |
 
 ## Next permitted implementation work
 

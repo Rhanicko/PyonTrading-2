@@ -24,6 +24,8 @@ class Settings:
     symbol: str | None = os.getenv("PYON_SYMBOL") or None
     quote_poll_seconds: float = float(os.getenv("PYON_QUOTE_POLL_SECONDS", "2"))
     research_poll_seconds: float = float(os.getenv("PYON_RESEARCH_POLL_SECONDS", "30"))
+    research_cycle_timeout_seconds: float = float(os.getenv("PYON_RESEARCH_CYCLE_TIMEOUT_SECONDS", "45"))
+    research_retry_max_seconds: float = float(os.getenv("PYON_RESEARCH_RETRY_MAX_SECONDS", "300"))
     research_bootstrap_retry_seconds: int = int(os.getenv("PYON_RESEARCH_BOOTSTRAP_RETRY_SECONDS", "21600"))
     training_interval_seconds: int = int(os.getenv("PYON_TRAINING_INTERVAL_SECONDS", "21600"))
     delayed_seconds: int = int(os.getenv("PYON_DELAYED_SECONDS", "5"))
@@ -36,6 +38,8 @@ class Settings:
     wti_symbol: str | None = os.getenv("PYON_WTI_SYMBOL") or None
     volatility_symbol: str | None = os.getenv("PYON_VOLATILITY_SYMBOL") or None
     operator_token: str | None = os.getenv("PYON_OPERATOR_TOKEN") or None
+    hfm_demo_login: str | None = os.getenv("PYON_HFM_DEMO_LOGIN") or None
+    hfm_demo_server: str | None = os.getenv("PYON_HFM_DEMO_SERVER") or None
     database_path: Path = PROJECT_ROOT / "data" / "pyontrading2.db"
     frontend_dist: Path = PROJECT_ROOT / "frontend" / "dist"
 

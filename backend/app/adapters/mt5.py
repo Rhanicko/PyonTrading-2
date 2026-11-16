@@ -4,21 +4,34 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import os
 import subprocess
+from functools import wraps
+from math import isfinite
+from threading import RLock
 from typing import Any
 
 from app.config import settings
 from app.market.timestamps import MAX_FUTURE_SOURCE_SECONDS, normalize_broker_timestamp
 from app.market.timeframes import TIMEFRAME_NAMES
-from app.schemas.market import Candle, ConnectionResponse, DataStatus, MarketDepthReport, QuoteResponse, SymbolSummary
+from app.schemas.market import Candle, ConnectionResponse, DataStatus, HfmAccountFinancials, HfmAccountStatus, HfmDemoStatus, MarketDepthReport, QuoteResponse, SymbolSummary
 
 
 GOLD_ALIAS_TERMS = ("XAUUSD", "GOLD")
+
+
+def serialized_mt5_call(method):
+    """Keep official MT5 session reads and lifecycle calls single-filed per adapter."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._mt5_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class MT5Adapter:
     """Thin read-only boundary around the official MT5 terminal package."""
 
     def __init__(self) -> None:
+        self._mt5_lock = RLock()
         self._mt5: Any | None = None
         self._last_error: str | None = None
         self._session_active = False
@@ -92,6 +105,7 @@ class MT5Adapter:
                 return candidate.resolve()
         return None
 
+    @serialized_mt5_call
     def start_terminal_at_startup(self) -> tuple[bool, str]:
         """Start MT5 once when PyonTrading starts, without managing it later.
 
@@ -129,6 +143,7 @@ class MT5Adapter:
         except Exception:
             return False
 
+    @serialized_mt5_call
     def shutdown(self) -> None:
         """Release the Python API session without terminating the user's MT5 terminal."""
         self._session_active = False
@@ -140,6 +155,7 @@ class MT5Adapter:
         except Exception as error:
             self._last_error = f"MT5_SHUTDOWN_FAILED_{type(error).__name__}"
 
+    @serialized_mt5_call
     def connect(self) -> bool:
         if self._mt5 is None:
             return False
@@ -161,6 +177,7 @@ class MT5Adapter:
             self._last_error = self._error()
         return connected
 
+    @serialized_mt5_call
     def connection(self, configured_symbol: str | None) -> ConnectionResponse:
         observed = datetime.now(UTC)
         if not self.connect():
@@ -195,6 +212,184 @@ class MT5Adapter:
             gold_symbols=gold_symbols,
         )
 
+    @serialized_mt5_call
+    def hfm_account_status(self, configured_symbol: str | None) -> HfmAccountStatus:
+        """Identify an active HFM demo or real account; never read credentials."""
+        observed = datetime.now(UTC)
+        if not self.connect():
+            return HfmAccountStatus(
+                observed_at_utc=observed, data_status=DataStatus.DISCONNECTED,
+                configured_symbol=configured_symbol,
+                reason_codes=[self._last_error or "MT5_TERMINAL_NOT_AVAILABLE"],
+            )
+        terminal = self._mt5.terminal_info()
+        account = self._mt5.account_info()
+        if terminal is None or account is None:
+            return HfmAccountStatus(
+                observed_at_utc=observed, data_status=DataStatus.SOURCE_ERROR,
+                configured_symbol=configured_symbol,
+                reason_codes=["MT5_ACCOUNT_INFORMATION_UNAVAILABLE"],
+            )
+        server = getattr(account, "server", None)
+        company = str(getattr(account, "company", "") or "").casefold().replace(" ", "")
+        mode_value = getattr(account, "trade_mode", None)
+        demo = getattr(self._mt5, "ACCOUNT_TRADE_MODE_DEMO", object())
+        real = getattr(self._mt5, "ACCOUNT_TRADE_MODE_REAL", object())
+        mode = "DEMO" if mode_value == demo else "LIVE" if mode_value == real else "UNKNOWN"
+        reasons = []
+        if not getattr(terminal, "connected", False):
+            reasons.append("MT5_TERMINAL_DISCONNECTED")
+        if not company.startswith(("hfmarkets", "hfm")):
+            reasons.append("HFM_BROKER_NOT_VERIFIED")
+        if not server:
+            reasons.append("BROKER_SERVER_UNAVAILABLE")
+        if mode == "UNKNOWN":
+            reasons.append("ACCOUNT_MODE_UNKNOWN")
+        login = str(getattr(account, "login", "") or "")
+        account_id_suffix = login[-4:] if not reasons and login.isdecimal() and len(login) > 4 else None
+        return HfmAccountStatus(
+            observed_at_utc=observed, data_status=DataStatus.LIVE if not reasons else DataStatus.SOURCE_ERROR,
+            connected=not reasons, account_mode=mode, broker_server=server,
+            account_id_suffix=account_id_suffix,
+            configured_symbol=configured_symbol, reason_codes=reasons,
+        )
+
+    @serialized_mt5_call
+    def hfm_account_financials(self) -> HfmAccountFinancials:
+        """Read current USD values only from a verified HFM terminal session."""
+        observed = datetime.now(UTC)
+        if not self.connect():
+            return HfmAccountFinancials(
+                observed_at_utc=observed, data_status=DataStatus.DISCONNECTED,
+                reason_codes=[self._last_error or "MT5_TERMINAL_NOT_AVAILABLE"],
+            )
+        terminal = self._mt5.terminal_info()
+        account = self._mt5.account_info()
+        if terminal is None or account is None:
+            return HfmAccountFinancials(
+                observed_at_utc=observed, data_status=DataStatus.SOURCE_ERROR,
+                reason_codes=["MT5_ACCOUNT_INFORMATION_UNAVAILABLE"],
+            )
+        server = getattr(account, "server", None)
+        company = str(getattr(account, "company", "") or "").casefold().replace(" ", "")
+        mode_value = getattr(account, "trade_mode", None)
+        demo = getattr(self._mt5, "ACCOUNT_TRADE_MODE_DEMO", object())
+        real = getattr(self._mt5, "ACCOUNT_TRADE_MODE_REAL", object())
+        mode = "DEMO" if mode_value == demo else "LIVE" if mode_value == real else "UNKNOWN"
+        currency = getattr(account, "currency", None)
+        reasons = []
+        if not getattr(terminal, "connected", False):
+            reasons.append("MT5_TERMINAL_DISCONNECTED")
+        if not company.startswith(("hfmarkets", "hfm")):
+            reasons.append("HFM_BROKER_NOT_VERIFIED")
+        if not server:
+            reasons.append("BROKER_SERVER_UNAVAILABLE")
+        if mode == "UNKNOWN":
+            reasons.append("ACCOUNT_MODE_UNKNOWN")
+        if reasons:
+            return HfmAccountFinancials(
+                observed_at_utc=observed, data_status=DataStatus.SOURCE_ERROR,
+                reason_codes=reasons,
+            )
+        login = str(getattr(account, "login", "") or "")
+        suffix = login[-4:] if login.isdecimal() and len(login) > 4 else None
+        if not isinstance(currency, str) or currency.upper() != "USD":
+            return HfmAccountFinancials(
+                observed_at_utc=observed, data_status=DataStatus.NOT_CONFIGURED,
+                account_mode=mode, broker_server=server, account_id_suffix=suffix,
+                currency=currency if isinstance(currency, str) else None,
+                reason_codes=["USD_ACCOUNT_CURRENCY_REQUIRED"],
+            )
+        balance = getattr(account, "balance", None)
+        equity = getattr(account, "equity", None)
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value) for value in (balance, equity)):
+            return HfmAccountFinancials(
+                observed_at_utc=observed, data_status=DataStatus.SOURCE_ERROR,
+                account_mode=mode, broker_server=server, account_id_suffix=suffix,
+                currency="USD", reason_codes=["ACCOUNT_FINANCIALS_INVALID"],
+            )
+        return HfmAccountFinancials(
+            observed_at_utc=observed, data_status=DataStatus.LIVE,
+            account_mode=mode, broker_server=server, account_id_suffix=suffix,
+            currency="USD", balance=float(balance), equity=float(equity),
+        )
+
+    @serialized_mt5_call
+    def hfm_demo_status(
+        self,
+        configured_symbol: str | None,
+        *,
+        expected_login: str | None,
+        expected_server: str | None,
+    ) -> HfmDemoStatus:
+        """Verify the active terminal session without accepting or disclosing credentials."""
+        observed = datetime.now(UTC)
+        if not self.connect():
+            return HfmDemoStatus(
+                observed_at_utc=observed, data_status=DataStatus.DISCONNECTED,
+                configured_symbol=configured_symbol,
+                reason_codes=[self._last_error or "MT5_TERMINAL_NOT_AVAILABLE"],
+            )
+        terminal = self._mt5.terminal_info()
+        account = self._mt5.account_info()
+        if terminal is None or account is None:
+            return HfmDemoStatus(
+                observed_at_utc=observed, data_status=DataStatus.SOURCE_ERROR,
+                configured_symbol=configured_symbol,
+                reason_codes=["MT5_ACCOUNT_INFORMATION_UNAVAILABLE"],
+            )
+
+        server = getattr(account, "server", None)
+        company = str(getattr(account, "company", "") or "").casefold().replace(" ", "")
+        demo = getattr(self._mt5, "ACCOUNT_TRADE_MODE_DEMO", object())
+        real = getattr(self._mt5, "ACCOUNT_TRADE_MODE_REAL", object())
+        mode_value = getattr(account, "trade_mode", None)
+        mode = "DEMO" if mode_value == demo else "LIVE" if mode_value == real else "UNKNOWN"
+        reasons = []
+        if not expected_login or not expected_server:
+            reasons.append("DEMO_ACCOUNT_BINDING_NOT_CONFIGURED")
+        elif str(getattr(account, "login", "")) != expected_login or server != expected_server:
+            reasons.append("DEMO_ACCOUNT_BINDING_MISMATCH")
+        if mode != "DEMO" or not server or "demo" not in server.casefold():
+            reasons.append("HFM_DEMO_ACCOUNT_REQUIRED")
+        if "hfmarkets" not in company and "hfm" not in company:
+            reasons.append("HFM_BROKER_NOT_VERIFIED")
+        if not all((
+            getattr(terminal, "connected", False),
+            getattr(terminal, "trade_allowed", False),
+            getattr(account, "trade_allowed", False),
+            getattr(account, "trade_expert", False),
+        )):
+            reasons.append("TERMINAL_OR_ACCOUNT_TRADING_DISABLED")
+        if getattr(terminal, "tradeapi_disabled", False):
+            reasons.append("MT5_TRADE_API_DISABLED")
+        if not configured_symbol:
+            reasons.append("SYMBOL_NOT_SELECTED")
+        elif self._mt5.symbol_info(configured_symbol) is None:
+            reasons.append("EXACT_BROKER_SYMBOL_UNAVAILABLE")
+        return HfmDemoStatus(
+            observed_at_utc=observed, data_status=DataStatus.LIVE,
+            ready=not reasons, account_mode=mode, broker_server=server,
+            configured_symbol=configured_symbol, reason_codes=reasons,
+        )
+
+    @serialized_mt5_call
+    def research_instruments(self) -> tuple[DataStatus, list[str], list[dict[str, str]]]:
+        """Discover visible major FX/metals using broker currency metadata, preserving exact aliases."""
+        if not self.connect():
+            return DataStatus.DISCONNECTED, [self._last_error or "MT5_TERMINAL_NOT_AVAILABLE"], []
+        symbols = self._mt5.symbols_get()
+        if symbols is None:
+            return DataStatus.SOURCE_ERROR, ["BROKER_SYMBOL_DISCOVERY_FAILED"], []
+        currencies = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "XAU"}
+        discovered = []
+        for item in symbols:
+            base, quote = getattr(item, "currency_base", ""), getattr(item, "currency_profit", "")
+            if getattr(item, "visible", False) and base in currencies and quote in currencies and base != quote:
+                discovered.append({"symbol": item.name, "base_currency": base, "quote_currency": quote})
+        return DataStatus.LIVE, [], sorted(discovered, key=lambda item: item["symbol"])
+
+    @serialized_mt5_call
     def quote(self, symbol: str | None) -> QuoteResponse:
         observed = datetime.now(UTC)
         if not symbol:
@@ -257,6 +452,7 @@ class MT5Adapter:
             freeze_level_points=int(info.trade_freeze_level),
         )
 
+    @serialized_mt5_call
     def candles(self, symbol: str | None, timeframe: str, limit: int) -> tuple[DataStatus, list[str], list[Candle]]:
         observed = datetime.now(UTC)
         if not symbol:
@@ -296,6 +492,7 @@ class MT5Adapter:
         reasons = [f"BROKER_CLOCK_OFFSET_NORMALIZED_{timestamp.broker_clock_offset_seconds}S"] if timestamp.normalized else []
         return DataStatus.LIVE, reasons, candles
 
+    @serialized_mt5_call
     def market_depth(self, symbol: str | None) -> MarketDepthReport:
         """Return broker DOM capability without mislabelling it as futures flow.
 
@@ -351,6 +548,7 @@ class MT5Adapter:
             reason_codes=["MT5_BROKER_DEPTH_ONLY", "DISPLAYED_ORDERS_CAN_CANCEL", "NOT_CONSOLIDATED_FUTURES_DEPTH"],
         )
 
+    @serialized_mt5_call
     def enable_context_symbol(self, symbol: str) -> tuple[bool, list[str]]:
         """Make one exact existing MT5 instrument visible for read-only context collection."""
         if not self.connect():

@@ -19,6 +19,9 @@ from app.schemas.market import (
     CandlesResponse,
     DataStatus,
     EventsResponse,
+    HfmAccountStatus,
+    HfmAccountFinancials,
+    HfmDemoStatus,
     JournalEvaluation,
     KillSwitchPayload,
     KronosForecastsResponse,
@@ -26,6 +29,7 @@ from app.schemas.market import (
     LiveResearchWatchResponse,
     MarketAnalysisResponse,
     OperationsStatus,
+    PipelineControlPayload,
     ResearchModelsResponse,
     ResearchResponse,
     SettingsPayload,
@@ -40,6 +44,7 @@ from app.schemas.market import (
     StrategySettingsResponse,
     SymbolsResponse,
     ValidationSummary,
+    WalkForwardResponse,
 )
 from app.storage.database import (
     read_operations_status,
@@ -56,6 +61,8 @@ from app.storage.database import (
     write_settings,
     write_strategy_setting,
 )
+
+from app.schemas.market import MarketScanResponse
 
 
 router = APIRouter(prefix="/api")
@@ -75,10 +82,16 @@ def require_operator_token(x_pyon_operator_token: str | None = Header(default=No
 def health(request: Request):
     live = service(request)
     connection = live.adapter.connection(live.configured_symbol)
+    quote_snapshot = live.adapter.quote(live.configured_symbol)
     return {
         "source": "PYONTRADING2", "source_timestamp_utc": connection.source_timestamp_utc,
         "observed_at_utc": datetime.now(UTC), "data_status": connection.data_status,
-        "reason_codes": connection.reason_codes, "ready": True, "mt5_terminal_connected": connection.terminal_connected,
+        "reason_codes": connection.reason_codes, "ready": True, "readiness_scope": "HTTP_SERVICE",
+        "mt5_terminal_connected": connection.terminal_connected,
+        "market_data_status": quote_snapshot.data_status,
+        "market_data_live": quote_snapshot.data_status == DataStatus.LIVE,
+        "market_data_source_timestamp_utc": quote_snapshot.source_timestamp_utc,
+        "market_data_reason_codes": quote_snapshot.reason_codes,
     }
 
 
@@ -86,6 +99,30 @@ def health(request: Request):
 def connection(request: Request):
     live = service(request)
     return live.adapter.connection(live.configured_symbol)
+
+
+@router.get("/hfm/demo/status", response_model=HfmDemoStatus)
+def hfm_demo_status(request: Request):
+    """Check the bound HFM demo session without returning account credentials."""
+    live = service(request)
+    return live.adapter.hfm_demo_status(
+        live.configured_symbol,
+        expected_login=settings.hfm_demo_login,
+        expected_server=settings.hfm_demo_server,
+    )
+
+
+@router.get("/hfm/account/status", response_model=HfmAccountStatus)
+def hfm_account_status(request: Request):
+    """Identify the active local HFM MT5 session without a password or order access."""
+    live = service(request)
+    return live.adapter.hfm_account_status(live.configured_symbol)
+
+
+@router.get("/hfm/account/financials", response_model=HfmAccountFinancials)
+def hfm_account_financials(request: Request, _operator: None = Depends(require_operator_token)):
+    """Read USD balance/equity from the local MT5 account; never cache it."""
+    return service(request).adapter.hfm_account_financials()
 
 
 @router.get("/symbols", response_model=SymbolsResponse)
@@ -109,6 +146,17 @@ def quote(request: Request, symbol: str | None = Query(default=None, pattern=r"^
     if symbol and live.configured_symbol and symbol != live.configured_symbol:
         raise HTTPException(status_code=409, detail={"reason_codes": ["SYMBOL_NOT_CONFIGURED"]})
     return live.adapter.quote(symbol or live.configured_symbol)
+
+
+@router.get("/market/scan", response_model=MarketScanResponse)
+def market_scan(request: Request, symbols: str | None = Query(default=None, max_length=264, pattern=r"^[A-Za-z0-9._,-]+$")):
+    try:
+        return request.app.state.market_scanner.snapshot(
+            symbols.split(",") if symbols is not None else None,
+            preferred_symbol=service(request).configured_symbol,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail={"reason_codes": [str(error)]}) from error
 
 
 @router.get("/candles")
@@ -171,7 +219,7 @@ def signals(request: Request):
 
 @router.get("/signals/history", response_model=SignalHistoryResponse)
 def signal_history(request: Request, limit: int = Query(default=12, ge=1, le=50)):
-    """List immutable research screens returned after a local Analyze market request."""
+    """List frozen automatic research signals and user-requested review snapshots."""
     live = service(request)
     quote_snapshot = live.latest_quote or live.adapter.quote(live.configured_symbol)
     return SignalHistoryResponse(
@@ -242,6 +290,18 @@ def research_pipeline(request: Request):
 def research_jobs(request: Request):
     """Expose the actual background-worker state and durable job counters."""
     return request.app.state.research_pipeline.status()
+
+
+@router.post("/research/pipeline/control")
+async def set_research_pipeline_control(
+    payload: PipelineControlPayload,
+    request: Request,
+    _operator: None = Depends(require_operator_token),
+):
+    """Pause or resume background research only; this never arms broker orders."""
+    pipeline = request.app.state.research_pipeline
+    pipeline.set_enabled(payload.enabled)
+    return pipeline.status()
 
 
 @router.get("/research/models", response_model=ResearchModelsResponse)
@@ -389,6 +449,13 @@ def analyze_research(request: Request):
 def run_backtest(request: Request):
     live = service(request)
     return request.app.state.backtest_service.run(live.configured_symbol)
+
+
+@router.post("/backtests/validate", response_model=WalkForwardResponse)
+def validate_full_archive(request: Request):
+    """Run review-only chronological validation on the active broker's archived M5 bars."""
+    live = service(request)
+    return request.app.state.backtest_service.validate_archive(live.configured_symbol)
 
 
 @router.get("/backtests", response_model=BacktestHistoryResponse)

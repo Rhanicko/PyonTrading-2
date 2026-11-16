@@ -1,4 +1,5 @@
 import type { MarketAnalysis, TimeframeEvidence } from "../types/api";
+import { TopDownPanel } from "./TopDownPanel";
 
 interface Props {
   analysis: MarketAnalysis;
@@ -61,6 +62,7 @@ export function MarketReviewModal({ analysis, onClose, onMinimize }: Props) {
         </ul>
       </section>
 
+      <TopDownPanel validation={analysis.top_down} />
       <section className="modal-section" aria-labelledby="integrity-title">
         <div className="modal-section-heading"><h3 id="integrity-title">Integrity & regime</h3><small>Observable source conditions</small></div>
         <div className="indicator-grid compact-readings">
@@ -113,9 +115,9 @@ export function MarketReviewModal({ analysis, onClose, onMinimize }: Props) {
       </section>
 
       <section className="modal-section" aria-labelledby="ensemble-title">
-        <div className="modal-section-heading"><h3 id="ensemble-title">Independent-rule ensemble</h3><small>Confidence remains withheld</small></div>
+        <div className="modal-section-heading"><h3 id="ensemble-title">Deterministic rule ensemble</h3><small>Confidence remains withheld</small></div>
         {analysis.strategy_ensemble ? <>
-          <p className="indicator-unavailable">{analysis.strategy_ensemble.agreement_count}/{analysis.strategy_ensemble.required_agreement_count} independent rules agree. Model state: {analysis.strategy_ensemble.model_promotion_state}.</p>
+          <p className="indicator-unavailable">{analysis.strategy_ensemble.agreement_count}/{analysis.strategy_ensemble.required_agreement_count} rules agree; some share M5 inputs. Model state: {analysis.strategy_ensemble.model_promotion_state}.</p>
           <ul className="modal-timeframes ensemble-votes">{analysis.strategy_ensemble.votes.map((vote) => <li key={vote.strategy_id}><div className="timeframe-label"><strong>{vote.strategy_id.replaceAll("_", " ")}</strong><span className={vote.decision === "WATCH_LONG" ? "positive" : vote.decision === "WATCH_SHORT" ? "negative" : "neutral"}>{vote.decision.replaceAll("_", " ")}</span></div><small>{vote.strategy_version} · completed-candle deterministic rule</small></li>)}</ul>
         </> : <p className="indicator-unavailable">The ensemble is unavailable because required source evidence is incomplete.</p>}
       </section>

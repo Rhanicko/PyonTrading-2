@@ -80,12 +80,15 @@ class ForexFactoryCalendarAdapter:
 
     @staticmethod
     def _filtered_response(source: EventsResponse, now: datetime, limit: int, today_only: bool) -> EventsResponse:
+        risk_events = [event for event in source.events if
+                       (event.impact == "High" and -timedelta(minutes=30) <= event.event_time_utc - now <= timedelta(hours=2))
+                       or (event.impact == "Medium" and -timedelta(minutes=15) <= event.event_time_utc - now <= timedelta(hours=1))]
         events = [event for event in source.events if event.event_time_utc >= now]
         if today_only:
             philippines_today = now.astimezone(MANILA_TIME).date()
             events = [event for event in events if event.event_time_manila.date() == philippines_today]
         events.sort(key=lambda event: event.event_time_utc)
-        return source.model_copy(update={"observed_at_utc": now, "events": events[:limit]})
+        return source.model_copy(update={"observed_at_utc": now, "events": events[:limit], "risk_events": risk_events})
 
     def _fetch_events(self) -> list[CalendarEvent]:
         error: Exception | None = None

@@ -17,6 +17,7 @@ from app.services.research import ResearchCoordinator
 from app.services.pipeline import ResearchPipeline
 from app.services.cross_market import CrossMarketContextService, CrossMarketSymbols
 from app.services.source_setup import SourceSetupService
+from app.services.scanner import MarketScanner
 from app.storage.database import initialize_database, read_settings
 
 
@@ -36,6 +37,7 @@ async def lifespan(app: FastAPI):
     elif launch_status not in {"MT5_TERMINAL_ALREADY_RUNNING", "MT5_AUTO_START_UNAVAILABLE"}:
         logger.warning("MT5 terminal was not started at PyonTrading startup: %s", launch_status)
     app.state.live_service = LiveService(adapter, stored.get("symbol") or settings.symbol, settings.database_path)
+    app.state.market_scanner = MarketScanner(adapter)
     app.state.calendar_service = ForexFactoryCalendarAdapter(settings.calendar_url, settings.calendar_ttl_seconds, settings.database_path)
     app.state.official_macro_service = OfficialMacroScheduleAdapter(ttl_seconds=settings.official_macro_ttl_seconds)
     app.state.cross_market_service = CrossMarketContextService(
@@ -64,6 +66,7 @@ async def lifespan(app: FastAPI):
         lambda: app.state.live_service.configured_symbol,
         app.state.official_macro_service,
     )
+    app.state.live_service.on_completed_bar = app.state.research_pipeline.notify_completed_bar
     await app.state.live_service.start()
     await app.state.research_pipeline.start()
     try:

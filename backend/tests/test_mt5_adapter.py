@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+import time
 import numpy as np
 
 from app.adapters.mt5 import MT5Adapter
@@ -112,6 +114,19 @@ class LifecycleMT5(FakeMT5):
         self.shutdown_calls += 1
 
 
+class ConcurrentInitializeMT5(FakeMT5):
+    def __init__(self) -> None:
+        self.active_initializations = 0
+        self.max_concurrent_initializations = 0
+
+    def initialize(self, **kwargs):
+        self.active_initializations += 1
+        self.max_concurrent_initializations = max(self.max_concurrent_initializations, self.active_initializations)
+        time.sleep(0.03)
+        self.active_initializations -= 1
+        return True
+
+
 def test_latest_mt5_bar_is_marked_forming_and_values_keep_precision():
     adapter = MT5Adapter()
     adapter._mt5 = FakeMT5()
@@ -129,6 +144,17 @@ def test_missing_symbol_never_returns_a_substitute_quote():
     result = adapter.quote(None)
     assert result.data_status == DataStatus.NOT_CONFIGURED
     assert result.bid is None and result.ask is None
+
+
+def test_mt5_initialization_is_serialized_across_concurrent_readers():
+    adapter = MT5Adapter()
+    fake = ConcurrentInitializeMT5()
+    adapter._mt5 = fake
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        assert list(workers.map(lambda _index: adapter.connect(), range(2))) == [True, True]
+
+    assert fake.max_concurrent_initializations == 1
 
 
 def test_future_broker_candle_timestamp_is_not_returned_as_live_history():

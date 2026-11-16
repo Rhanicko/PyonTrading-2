@@ -11,7 +11,7 @@ from app.schemas.market import Candle
 
 Direction = Literal["LONG", "SHORT"]
 StrategyId = Literal[
-    "PRICE_STRUCTURE_BASELINE", "ICT_LIQUIDITY_REVERSAL", "MOMENTUM_CONTINUATION", "HTF_TREND_PULLBACK",
+    "PRICE_STRUCTURE_BASELINE", "ICT_LIQUIDITY_REVERSAL", "MOMENTUM_CONTINUATION", "M5_TREND_PULLBACK",
     "LIQUIDITY_SWEEP_PROXY", "VWAP_TICK_PROXY_MOMENTUM", "OPENING_RANGE_BREAKOUT",
     "VOLUME_PROFILE_PROXY_AUCTION", "ORDER_FLOW_FUTURES_CONFIRMATION",
 ]
@@ -19,6 +19,16 @@ StrategyId = Literal[
 TIMEFRAME = timedelta(minutes=5)
 LOOKBACK_BARS = 80
 HOLD_BARS = 6
+
+
+def contiguous_segment_ids(candles: list[Candle]) -> list[int]:
+    """Identify uninterrupted M5 intervals; a missing bar ends a replay trial."""
+    segments = [0] * len(candles)
+    for index in range(1, len(candles)):
+        segments[index] = segments[index - 1] + int(
+            candles[index].open_time_utc - candles[index - 1].open_time_utc != TIMEFRAME
+        )
+    return segments
 
 
 @dataclass(frozen=True)
@@ -80,7 +90,7 @@ def _direction_from_momentum(snapshot: TechnicalSnapshot, history: list[Candle])
     return None
 
 
-def _direction_from_pullback(snapshot: TechnicalSnapshot, history: list[Candle]) -> Direction | None:
+def _direction_from_m5_pullback(snapshot: TechnicalSnapshot, history: list[Candle]) -> Direction | None:
     if snapshot.ema_20 is None or snapshot.ema_60 is None or snapshot.atr_14 is None or len(history) < 2:
         return None
     current, previous = history[-1], history[-2]
@@ -128,7 +138,7 @@ STRATEGY_CATALOG: tuple[tuple[StrategyId, str, str], ...] = (
     ("PRICE_STRUCTURE_BASELINE", "price-structure-baseline-v1", "PRICE_ONLY_BASELINE"),
     ("ICT_LIQUIDITY_REVERSAL", "ict-liquidity-reversal-v1", "ICT_PRICE_STRUCTURE"),
     ("MOMENTUM_CONTINUATION", "momentum-continuation-v1", "PRICE_INDICATORS_ONLY"),
-    ("HTF_TREND_PULLBACK", "htf-trend-pullback-v1", "PRICE_INDICATORS_ONLY"),
+    ("M5_TREND_PULLBACK", "m5-trend-pullback-v1", "M5_PRICE_INDICATORS_ONLY"),
     ("LIQUIDITY_SWEEP_PROXY", "liquidity-sweep-proxy-v1", "PRICE_ONLY_SWEEP_NO_ABSORPTION"),
     ("VWAP_TICK_PROXY_MOMENTUM", "vwap-tick-proxy-momentum-v1", "BROKER_TICK_PROXY"),
     ("OPENING_RANGE_BREAKOUT", "session-opening-range-v1", "COMPLETED_CANDLE_SESSION_RULE"),
@@ -146,7 +156,7 @@ def evaluate_historical_signals(candles: list[Candle]) -> list[HistoricalSignal]
         ("PRICE_STRUCTURE_BASELINE", "price-structure-baseline-v1", _direction_from_price_baseline),
         ("ICT_LIQUIDITY_REVERSAL", "ict-liquidity-reversal-v1", _direction_from_ict),
         ("MOMENTUM_CONTINUATION", "momentum-continuation-v1", _direction_from_momentum),
-        ("HTF_TREND_PULLBACK", "htf-trend-pullback-v1", _direction_from_pullback),
+        ("M5_TREND_PULLBACK", "m5-trend-pullback-v1", _direction_from_m5_pullback),
         ("LIQUIDITY_SWEEP_PROXY", "liquidity-sweep-proxy-v1", _direction_from_liquidity_sweep_proxy),
         ("VWAP_TICK_PROXY_MOMENTUM", "vwap-tick-proxy-momentum-v1", _direction_from_vwap_tick_proxy),
         ("OPENING_RANGE_BREAKOUT", "session-opening-range-v1", _direction_from_opening_range),
@@ -185,15 +195,20 @@ def run_backtest(candles: list[Candle], point: float | None) -> tuple[list[Strat
     are deliberately *not* estimated; affected net metrics remain unavailable.
     """
     values = completed_candles(candles)
-    if len(values) < LOOKBACK_BARS + HOLD_BARS + 1:
+    if len(values) < LOOKBACK_BARS + HOLD_BARS:
         return [], [], ("HISTORY_INSUFFICIENT", "NO_BACKTEST_PERFORMANCE_CLAIM")
 
     signals = evaluate_historical_signals(values)
+    segments = contiguous_segment_ids(values)
     trades: list[BacktestTrade] = []
+    gap_excluded = False
     for signal in signals:
         entry_index = signal.known_at_index + 1
-        exit_index = entry_index + HOLD_BARS
+        exit_index = entry_index + HOLD_BARS - 1
         if exit_index >= len(values):
+            continue
+        if segments[signal.known_at_index] != segments[exit_index]:
+            gap_excluded = True
             continue
         entry, exit_candle = values[entry_index], values[exit_index]
         side = 1 if signal.direction == "LONG" else -1
@@ -221,8 +236,12 @@ def run_backtest(candles: list[Candle], point: float | None) -> tuple[list[Strat
             reason_codes=(
                 "COMPLETED_CANDLES_ONLY", "NEXT_BAR_ENTRY", "FIXED_HORIZON_EXIT",
                 "BROKER_SPREAD_ONLY" if cost_complete else "COSTS_INCOMPLETE",
+                "SPREAD_ADJUSTED_NOT_NET_PNL",
                 source_label,
                 "COMMISSION_UNAVAILABLE", "NO_ORDER_EXECUTION",
             ),
         ))
-    return results, trades, ("BACKTEST_RESEARCH_ONLY", "COMMISSION_UNAVAILABLE", "NO_ORDER_EXECUTION")
+    return results, trades, (
+        "BACKTEST_RESEARCH_ONLY", "SPREAD_ADJUSTED_NOT_NET_PNL", "COMMISSION_UNAVAILABLE",
+        *(("DISCONTINUOUS_TRIALS_EXCLUDED",) if gap_excluded else ()), "NO_ORDER_EXECUTION",
+    )

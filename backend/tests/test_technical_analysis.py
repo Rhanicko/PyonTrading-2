@@ -1,10 +1,32 @@
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from app.analysis.technical import analyze_completed_candles, confirmed_swings, fair_value_gaps, structure_events
+import pytest
+
+from app.analysis.technical import analyze_completed_candles, atr, completed_candles, confirmed_swings, fair_value_gaps, rsi, structure_events
 from app.schemas.market import Candle
+from app.analysis import technical
 
 
 FIVE_MINUTES = timedelta(minutes=5)
+
+
+def test_macd_does_not_recalculate_every_prefix_ema(monkeypatch):
+    original = technical.ema
+    calls = 0
+
+    def bounded_ema(values, period):
+        nonlocal calls
+        calls += 1
+        assert calls <= 3, "MACD must run in linear time, not recalculate EMA on each prefix"
+        return original(values, period)
+
+    monkeypatch.setattr(technical, "ema", bounded_ema)
+    line, signal, histogram = technical.macd([1, 2, 3, 5, 4, 7], 2, 3, 2)
+    assert line == pytest.approx(0.6435185185185182)
+    assert signal == pytest.approx(0.5617283950617282)
+    assert histogram == pytest.approx(0.08179012345679)
 
 
 def bar(index: int, *, high: float, low: float, close: float, completed: bool = True) -> Candle:
@@ -74,6 +96,24 @@ def test_forming_candle_cannot_change_technical_snapshot():
     assert baseline.adx_14 is not None
     assert baseline.bollinger_middle is not None and baseline.bollinger_upper is not None and baseline.bollinger_lower is not None
     assert baseline.roc_10 is not None and baseline.realized_volatility_20 is not None
+
+
+def test_rsi_and_atr_match_the_shared_completed_candle_golden_fixture():
+    fixture_path = Path(__file__).parents[2] / "fixtures" / "technical-golden.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    candles = [
+        Candle(
+            open_time_utc=datetime.fromisoformat(item["open_time_utc"].replace("Z", "+00:00")),
+            open=item["open"], high=item["high"], low=item["low"], close=item["close"],
+            tick_volume=item["tick_volume"], completed=item["completed"],
+        )
+        for item in fixture["candles"]
+    ]
+
+    completed = completed_candles(candles)
+    assert len(completed) == fixture["expected"]["completed_count"]
+    assert rsi([candle.close for candle in completed]) == pytest.approx(fixture["expected"]["rsi_14"])
+    assert atr(completed) == pytest.approx(fixture["expected"]["atr_14"])
 
 
 def test_fair_value_gap_mitigation_uses_only_a_later_completed_candle():
